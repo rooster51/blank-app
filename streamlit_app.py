@@ -1,4 +1,3 @@
-import os
 import math
 import time
 import random
@@ -11,45 +10,35 @@ import yfinance as yf
 from yfinance.exceptions import YFRateLimitError
 from scipy.stats import norm
 
-# Optional Finnhub (kept as optional; you can remove if not using)
-try:
-    import finnhub
-except Exception:
-    finnhub = None
-
-# -----------------------------
-# Page / App config
-# -----------------------------
-st.set_page_config(page_title="Credit Spread Trend Scanner", layout="wide")
-
-st.title("📈 Trend Scanner → Credit Spread Builder")
-st.caption("Educational only. Options trading involves substantial risk, including assignment risk.")
+# =========================
+# App config
+# =========================
+st.set_page_config(page_title="Trend + Credit Spreads", layout="wide")
 
 TZ = "America/New_York"
+DEFAULT_WATCHLIST = ["NVDA", "AAPL", "MSFT", "SPY", "QQQ", "TSLA", "AMD", "META", "AMZN", "GOOGL", "IWM", "XLF", "BAC", "F"]
 
-DEFAULT_WATCHLIST = ["NVDA", "AAPL", "MSFT", "SPY", "QQQ", "TSLA", "AMD", "META", "AMZN", "GOOGL"]
+# =========================
+# Styling (dark-friendly)
+# =========================
+st.markdown(
+    """
+<style>
+.block-container { max-width: 1180px; padding-top: 1.0rem; padding-bottom: 2.5rem; }
+.small-muted { opacity: 0.8; font-size: 0.92rem; }
+.card { border: 1px solid rgba(255,255,255,0.12); border-radius: 14px; padding: 14px; background: rgba(255,255,255,0.03); }
+hr { border: none; border-top: 1px solid rgba(255,255,255,0.12); margin: 0.75rem 0; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
-# Replaced 5m + 1h with 15m + 4h (and 1D)
-TIMEFRAMES = ["15m", "4h", "1D"]
+st.title("📈 Trend Scanner → Credit Spread Builder")
+st.caption("Educational only. Options trading involves substantial risk (assignment, gap risk, liquidity).")
 
-# -----------------------------
-# Finnhub key handling (optional)
-# -----------------------------
-def get_finnhub_key() -> str:
-    k = st.secrets.get("FINNHUB_API_KEY", "")
-    if k:
-        return str(k).strip()
-    return os.environ.get("FINNHUB_API_KEY", "").strip()
-
-def get_finnhub_client():
-    key = get_finnhub_key()
-    if key and finnhub is not None:
-        return finnhub.Client(api_key=key)
-    return None
-
-# -----------------------------
+# =========================
 # Indicators / Trend
-# -----------------------------
+# =========================
 def sma(s: pd.Series, n: int) -> pd.Series:
     return s.rolling(n).mean()
 
@@ -60,53 +49,65 @@ def rsi(close: pd.Series, n: int = 14) -> pd.Series:
     rs = up.rolling(n).mean() / down.rolling(n).mean()
     return 100 - (100 / (1 + rs))
 
-def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    high, low, close = df["high"], df["low"], df["close"]
-    tr = pd.concat([(high - low), (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
-    return tr.rolling(n).mean()
-
 def compute_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out["SMA20"] = sma(out["close"], 20)
-    out["SMA50"] = sma(out["close"], 50)
-    out["SMA200"] = sma(out["close"], 200)
-    out["RSI14"] = rsi(out["close"], 14)
-    out["ATR14"] = atr(out, 14)
-    return out
+    d = df.copy()
+    d["SMA20"] = sma(d["close"], 20)
+    d["SMA50"] = sma(d["close"], 50)
+    d["SMA200"] = sma(d["close"], 200)
+    d["RSI14"] = rsi(d["close"], 14)
+    return d
 
-def classify_trend(df: pd.DataFrame) -> dict:
-    if df is None or len(df) < 220 or df["SMA200"].isna().iloc[-1]:
-        return {"direction": "insufficient", "strength": 0, "regime": "", "notes": "Need ~200+ bars"}
+def classify_trend_adaptive(df: pd.DataFrame) -> dict:
+    if df is None or df.empty or len(df) < 60:
+        return {"direction": "insufficient", "strength": 0, "regime": "", "notes": "Need ~60+ bars"}
 
     last = df.iloc[-1]
-    sma20, sma50, sma200 = last["SMA20"], last["SMA50"], last["SMA200"]
     close = float(last["close"])
     r = float(last["RSI14"]) if pd.notna(last["RSI14"]) else 50.0
+    s20 = last.get("SMA20", np.nan)
+    s50 = last.get("SMA50", np.nan)
+    s200 = last.get("SMA200", np.nan)
 
-    if sma20 > sma50 > sma200 and close > sma20:
-        direction = "bullish"
-        strength = 80
-    elif sma20 > sma50:
-        direction = "bullish"
-        strength = 60
-    elif sma20 < sma50 < sma200 and close < sma20:
-        direction = "bearish"
-        strength = 80
-    elif sma20 < sma50:
-        direction = "bearish"
-        strength = 60
-    else:
-        direction = "neutral"
-        strength = 45
+    has_50 = pd.notna(s50)
+    has_200 = pd.notna(s200)
+
+    direction = "neutral"
+    strength = 45
+
+    if has_50 and pd.notna(s20):
+        if has_200:
+            if s20 > s50 > s200 and close > s20:
+                direction, strength = "bullish", 80
+            elif s20 > s50:
+                direction, strength = "bullish", 60
+            elif s20 < s50 < s200 and close < s20:
+                direction, strength = "bearish", 80
+            elif s20 < s50:
+                direction, strength = "bearish", 60
+            else:
+                direction, strength = "neutral", 45
+        else:
+            if s20 > s50 and close > s20:
+                direction, strength = "bullish", 65
+            elif s20 > s50:
+                direction, strength = "bullish", 55
+            elif s20 < s50 and close < s20:
+                direction, strength = "bearish", 65
+            elif s20 < s50:
+                direction, strength = "bearish", 55
+            else:
+                direction, strength = "neutral", 45
 
     if direction in ("bullish", "bearish") and (r >= 60 or r <= 40):
         regime = "trending"
+        strength = min(90, strength + 10)
     elif 45 <= r <= 55:
         regime = "range"
     else:
         regime = "transition"
 
-    return {"direction": direction, "strength": strength, "regime": regime, "notes": f"RSI={r:.1f} Close={close:.2f}"}
+    notes = f"RSI={r:.1f} Close={close:.2f}" + ("" if has_200 else " (no SMA200)")
+    return {"direction": direction, "strength": strength, "regime": regime, "notes": notes}
 
 def decide_bias(trend_matrix: dict) -> str:
     score = 0
@@ -122,19 +123,19 @@ def decide_bias(trend_matrix: dict) -> str:
         return "bearish"
     return "neutral"
 
-# -----------------------------
-# Data fetch (yfinance + rate-safe)
-# -----------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+# =========================
+# Data fetch (yfinance + backoff)
+# =========================
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_yf(symbol: str, interval: str, period: str) -> pd.DataFrame | None:
     tkr = yf.Ticker(symbol)
-    for attempt in range(4):
+    for attempt in range(5):
         try:
             hist = tkr.history(period=period, interval=interval, auto_adjust=False)
             if hist is None or hist.empty:
                 return None
-            df = hist.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})[
-                ["open", "high", "low", "close", "volume"]
+            df = hist.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})[
+                ["open","high","low","close","volume"]
             ].copy()
             if df.index.tz is None:
                 df.index = df.index.tz_localize("UTC")
@@ -142,7 +143,7 @@ def fetch_yf(symbol: str, interval: str, period: str) -> pd.DataFrame | None:
             df.index.name = "time"
             return df
         except YFRateLimitError:
-            time.sleep((2 ** attempt) + random.uniform(0, 0.8))
+            time.sleep((2 ** attempt) + random.uniform(0, 0.7))
         except Exception:
             return None
     return None
@@ -161,12 +162,12 @@ def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
 def fetch_timeframes(symbol: str):
     df_15m = fetch_yf(symbol, "15m", "60d")
     df_4h = resample_ohlcv(df_15m, "4H") if df_15m is not None and not df_15m.empty else None
-    df_1d = fetch_yf(symbol, "1d", "2y")
+    df_1d = fetch_yf(symbol, "1d", "3y")
     return {"15m": df_15m, "4h": df_4h, "1D": df_1d}
 
-# -----------------------------
-# Options + spreads
-# -----------------------------
+# =========================
+# Options + spread builder
+# =========================
 def bs_delta(S, K, T, r, sigma, is_call: bool):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return np.nan
@@ -185,6 +186,11 @@ def enrich_chain_with_delta(chain_df: pd.DataFrame, S: float, expiry: str, r: fl
     ask = df.get("ask", pd.Series(np.nan, index=df.index))
     df["mid"] = np.where(np.isfinite(bid) & np.isfinite(ask) & (ask > 0), (bid + ask) / 2.0, np.nan)
 
+    # spread % relative to mid
+    df["spread_abs"] = (ask - bid)
+    df["spread_pct"] = np.where(np.isfinite(df["mid"]) & (df["mid"] > 0),
+                                (df["spread_abs"] / df["mid"]), np.nan)
+
     deltas = []
     for _, row in df.iterrows():
         K = float(row.get("strike", np.nan))
@@ -196,89 +202,126 @@ def enrich_chain_with_delta(chain_df: pd.DataFrame, S: float, expiry: str, r: fl
     df["delta_est"] = deltas
     return df
 
-def pick_expiration(tkr: yf.Ticker, dte_min: int, dte_max: int):
-    exps = tkr.options
+def list_expirations(tkr: yf.Ticker):
+    try:
+        return list(tkr.options) or []
+    except Exception:
+        return []
+
+def pick_expiration_in_window(exps: list[str], dte_min: int, dte_max: int):
     if not exps:
         return None
     today = date.today()
-    target = int(round((dte_min + dte_max) / 2))
-    scored = []
+    candidates = []
     for e in exps:
-        ed = datetime.strptime(e, "%Y-%m-%d").date()
-        dte = (ed - today).days
-        scored.append((abs(dte - target), dte, e))
-    within = [x for x in scored if dte_min <= x[1] <= dte_max]
-    return sorted(within or scored, key=lambda x: x[0])[0][2]
+        try:
+            ed = datetime.strptime(e, "%Y-%m-%d").date()
+            dte = (ed - today).days
+            if dte_min <= dte <= dte_max:
+                candidates.append((dte, e))
+        except Exception:
+            pass
+    if not candidates:
+        return None
+    target = int(round((dte_min + dte_max) / 2))
+    return sorted(candidates, key=lambda x: abs(x[0] - target))[0][1]
 
-def _pick_short_by_delta(df: pd.DataFrame, target_delta: float, want_call: bool):
+def apply_liquidity_filter(df: pd.DataFrame, min_oi: int, min_vol: int, max_spread_pct: float):
+    """
+    Filters option chain rows by OI/volume/spread%.
+    Uses columns: openInterest, volume, spread_pct, mid.
+    """
+    x = df.copy()
+    if "openInterest" not in x.columns:
+        x["openInterest"] = 0
+    if "volume" not in x.columns:
+        x["volume"] = 0
+
+    cond = (
+        (x["openInterest"].fillna(0) >= min_oi) &
+        (x["volume"].fillna(0) >= min_vol) &
+        (x["mid"].notna()) &
+        (x["spread_pct"].fillna(np.inf) <= max_spread_pct)
+    )
+    return x[cond].copy()
+
+def pick_short_by_delta(df: pd.DataFrame, target_delta: float, want_call: bool):
     d_target = target_delta if want_call else -target_delta
     x = df.dropna(subset=["delta_est", "strike"]).copy()
     if x.empty:
         return None
     x["err"] = (x["delta_est"] - d_target).abs()
-    return x.sort_values("err").iloc[0]
+    # prefer tighter spreads if tie-ish
+    x["rank"] = x["err"] + 0.05 * x["spread_pct"].fillna(1.0)
+    return x.sort_values("rank").iloc[0]
 
-def _pick_wing(df: pd.DataFrame, short_strike: float, wing_steps: int, want_call: bool):
+def pick_wing_by_width(df: pd.DataFrame, short_strike: float, wing_width: float, want_call: bool):
     x = df.dropna(subset=["strike"]).copy()
-    if want_call:
-        cand = x[x["strike"] > short_strike].sort_values("strike", ascending=True)
-    else:
-        cand = x[x["strike"] < short_strike].sort_values("strike", ascending=False)
-    if cand.empty:
+    strikes = np.array(sorted(x["strike"].unique()))
+    if len(strikes) < 2:
         return None
-    idx = min(max(wing_steps, 1), len(cand) - 1)
-    return cand.iloc[idx]
 
-def _safe_mid(row):
+    if want_call:
+        target = short_strike + wing_width
+        cand = strikes[strikes > short_strike]
+        if len(cand) == 0:
+            return None
+        chosen = cand[np.argmin(np.abs(cand - target))]
+    else:
+        target = short_strike - wing_width
+        cand = strikes[strikes < short_strike]
+        if len(cand) == 0:
+            return None
+        chosen = cand[np.argmin(np.abs(cand - target))]
+
+    row = x[x["strike"] == chosen]
+    return row.iloc[0] if not row.empty else None
+
+def safe_mid(row):
     m = row.get("mid", np.nan)
     return float(m) if np.isfinite(m) else np.nan
 
-def build_vertical_credit(puts_e, calls_e, bias: str, target_delta: float, wing_steps: int):
-    if bias == "bullish":
-        short = _pick_short_by_delta(puts_e, target_delta, want_call=False)
-        if short is None:
-            return None
-        long = _pick_wing(puts_e, float(short["strike"]), wing_steps, want_call=False)
-        if long is None:
-            return None
-        credit = _safe_mid(short) - _safe_mid(long)
-        width = abs(float(short["strike"]) - float(long["strike"]))
-        max_loss = (width - credit) if np.isfinite(credit) else np.nan
-        return {"name": "Bull Put Spread",
-                "legs": [("SELL PUT", float(short["strike"])), ("BUY PUT", float(long["strike"]))],
-                "credit": credit, "width": width, "max_loss": max_loss}
+def build_bull_put(puts_e, target_delta: float, wing_width: float):
+    short = pick_short_by_delta(puts_e, target_delta, want_call=False)
+    if short is None:
+        return None
+    long = pick_wing_by_width(puts_e, float(short["strike"]), wing_width, want_call=False)
+    if long is None:
+        return None
+    credit = safe_mid(short) - safe_mid(long)
+    width = abs(float(short["strike"]) - float(long["strike"]))
+    max_loss = (width - credit) if np.isfinite(credit) else np.nan
+    return {"name":"Bull Put Spread","legs":[("SELL PUT", float(short["strike"])), ("BUY PUT", float(long["strike"]))],
+            "credit":credit,"width":width,"max_loss":max_loss}
 
-    if bias == "bearish":
-        short = _pick_short_by_delta(calls_e, target_delta, want_call=True)
-        if short is None:
-            return None
-        long = _pick_wing(calls_e, float(short["strike"]), wing_steps, want_call=True)
-        if long is None:
-            return None
-        credit = _safe_mid(short) - _safe_mid(long)
-        width = abs(float(long["strike"]) - float(short["strike"]))
-        max_loss = (width - credit) if np.isfinite(credit) else np.nan
-        return {"name": "Bear Call Spread",
-                "legs": [("SELL CALL", float(short["strike"])), ("BUY CALL", float(long["strike"]))],
-                "credit": credit, "width": width, "max_loss": max_loss}
+def build_bear_call(calls_e, target_delta: float, wing_width: float):
+    short = pick_short_by_delta(calls_e, target_delta, want_call=True)
+    if short is None:
+        return None
+    long = pick_wing_by_width(calls_e, float(short["strike"]), wing_width, want_call=True)
+    if long is None:
+        return None
+    credit = safe_mid(short) - safe_mid(long)
+    width = abs(float(long["strike"]) - float(short["strike"]))
+    max_loss = (width - credit) if np.isfinite(credit) else np.nan
+    return {"name":"Bear Call Spread","legs":[("SELL CALL", float(short["strike"])), ("BUY CALL", float(long["strike"]))],
+            "credit":credit,"width":width,"max_loss":max_loss}
 
-    return None
-
-def build_iron_condor(puts_e, calls_e, target_delta: float, wing_steps: int):
-    sp = _pick_short_by_delta(puts_e, target_delta, want_call=False)
-    sc = _pick_short_by_delta(calls_e, target_delta, want_call=True)
+def build_iron_condor(puts_e, calls_e, target_delta: float, wing_width: float):
+    sp = pick_short_by_delta(puts_e, target_delta, want_call=False)
+    sc = pick_short_by_delta(calls_e, target_delta, want_call=True)
     if sp is None or sc is None:
         return None
-    lp = _pick_wing(puts_e, float(sp["strike"]), wing_steps, want_call=False)
-    lc = _pick_wing(calls_e, float(sc["strike"]), wing_steps, want_call=True)
+    lp = pick_wing_by_width(puts_e, float(sp["strike"]), wing_width, want_call=False)
+    lc = pick_wing_by_width(calls_e, float(sc["strike"]), wing_width, want_call=True)
     if lp is None or lc is None:
         return None
 
     spk, lpk = float(sp["strike"]), float(lp["strike"])
     sck, lck = float(sc["strike"]), float(lc["strike"])
 
-    put_credit = _safe_mid(sp) - _safe_mid(lp)
-    call_credit = _safe_mid(sc) - _safe_mid(lc)
+    put_credit = safe_mid(sp) - safe_mid(lp)
+    call_credit = safe_mid(sc) - safe_mid(lc)
     total_credit = (put_credit + call_credit) if np.isfinite(put_credit) and np.isfinite(call_credit) else np.nan
 
     put_w = abs(spk - lpk)
@@ -286,162 +329,12 @@ def build_iron_condor(puts_e, calls_e, target_delta: float, wing_steps: int):
     max_w = max(put_w, call_w)
     max_loss = (max_w - total_credit) if np.isfinite(total_credit) else np.nan
 
-    return {
-        "name": "Iron Condor",
-        "legs": [("SELL PUT", spk), ("BUY PUT", lpk), ("SELL CALL", sck), ("BUY CALL", lck)],
-        "credit": total_credit,
-        "width": max_w,
-        "max_loss": max_loss,
-        "put_credit": put_credit,
-        "call_credit": call_credit,
-    }
+    return {"name":"Iron Condor",
+            "legs":[("SELL PUT", spk), ("BUY PUT", lpk), ("SELL CALL", sck), ("BUY CALL", lck)],
+            "credit":total_credit,"width":max_w,"max_loss":max_loss,
+            "put_credit":put_credit,"call_credit":call_credit}
 
-# -----------------------------
-# Sidebar controls (dropdown watchlist)
-# -----------------------------
-with st.sidebar:
-    st.header("Controls")
-
-    if "watchlist" not in st.session_state:
-        st.session_state.watchlist = DEFAULT_WATCHLIST.copy()
-
-    watchlist = st.session_state.watchlist
-
-    selected = st.selectbox("Watchlist", watchlist, index=0)
-
-    add_col1, add_col2 = st.columns([2, 1])
-    with add_col1:
-        new_sym = st.text_input("Add ticker", placeholder="NFLX").strip().upper()
-    with add_col2:
-        if st.button("Add", use_container_width=True):
-            if new_sym and new_sym not in watchlist:
-                watchlist.append(new_sym)
-                st.success(f"Added {new_sym}")
-                selected = new_sym
-
-    rem_col1, rem_col2 = st.columns([2, 1])
-    with rem_col1:
-        st.write(" ")
-    with rem_col2:
-        if st.button("Remove selected", use_container_width=True):
-            if len(watchlist) > 1 and selected in watchlist:
-                watchlist.remove(selected)
-                selected = watchlist[0]
-
-    symbol = st.text_input("Or type a ticker", value=selected).strip().upper()
-
-    st.divider()
-
-    dte_preset = st.selectbox("DTE window", ["7–21", "30–45", "Custom"])
-    if dte_preset == "7–21":
-        dte_min, dte_max = 7, 21
-    elif dte_preset == "30–45":
-        dte_min, dte_max = 30, 45
-    else:
-        dte_min = st.number_input("DTE min", min_value=1, max_value=365, value=7, step=1)
-        dte_max = st.number_input("DTE max", min_value=1, max_value=365, value=21, step=1)
-        if dte_min > dte_max:
-            dte_min, dte_max = dte_max, dte_min
-
-    mode = st.selectbox("Mode", ["Auto", "Bull Put", "Bear Call", "Iron Condor"])
-    target_delta = st.slider("Target delta", min_value=0.10, max_value=0.35, value=0.20, step=0.01)
-    wing_steps = st.slider("Wing steps", min_value=1, max_value=8, value=3, step=1)
-    r_rate = st.number_input("Risk-free rate (r)", min_value=0.0, max_value=0.20, value=0.04, step=0.005)
-    cache_ttl = st.slider("Cache TTL (seconds)", min_value=60, max_value=1800, value=300, step=60)
-
-    show_charts = st.checkbox("Show charts", value=True)
-    run = st.button("🚀 Run Scan", type="primary", use_container_width=True)
-
-    st.divider()
-    st.caption("If you get rate-limited by Yahoo, wait ~30–60 seconds and try again.")
-
-# -----------------------------
-# Main run
-# -----------------------------
-if run:
-    if not symbol:
-        st.error("Enter a ticker.")
-        st.stop()
-
-    fetch_yf.ttl = int(cache_ttl)
-
-    st.subheader(f"{symbol} — Multi-timeframe trend scan (15m / 4h / 1D)")
-
-    frames = fetch_timeframes(symbol)
-    trend_matrix = {}
-    latest_close = None
-
-    for tf_name in TIMEFRAMES:
-        df = frames.get(tf_name)
-        if df is None or df.empty:
-            trend_matrix[tf_name] = {"direction": "insufficient", "strength": 0, "regime": "", "notes": "No data"}
-            continue
-
-        df = compute_features(df)
-        summ = classify_trend(df)
-        trend_matrix[tf_name] = summ
-        latest_close = float(df["close"].iloc[-1])
-
-        with st.expander(
-            f"{tf_name} — {summ['direction']} ({summ['strength']}%) | {summ['regime']} | {summ['notes']}",
-            expanded=(tf_name == "1D"),
-        ):
-            st.write(summ)
-            if show_charts:
-                import matplotlib.pyplot as plt
-                dfp = df.tail(250).copy()
-                fig = plt.figure(figsize=(10, 3.5))
-                plt.plot(dfp.index, dfp["close"], label="Close")
-                for c in ["SMA20", "SMA50", "SMA200"]:
-                    if c in dfp.columns:
-                        plt.plot(dfp.index, dfp[c], label=c)
-                plt.title(f"{symbol} {tf_name}")
-                plt.grid(True)
-                plt.legend()
-                plt.tight_layout()
-                st.pyplot(fig, clear_figure=True)
-
-    auto_bias = decide_bias(trend_matrix)
-    st.info(f"Auto bias (weighted): **{auto_bias.upper()}**")
-
-    st.subheader("Options chain → strategy builder")
-
-    tkr = yf.Ticker(symbol)
-
-    spot = np.nan
-    try:
-        spot = float(getattr(tkr, "fast_info", {}).get("last_price", np.nan))
-    except Exception:
-        pass
-    if not np.isfinite(spot):
-        spot = float(latest_close) if latest_close is not None else np.nan
-
-    if np.isfinite(spot):
-        st.write(f"Spot: **{spot:.2f}**")
-    else:
-        st.error("Spot price unavailable.")
-        st.stop()
-
-    expiry = pick_expiration(tkr, int(dte_min), int(dte_max))
-    if not expiry:
-        st.error("No options expirations found for this symbol (or Yahoo options unavailable).")
-        st.stop()
-
-    ed = datetime.strptime(expiry, "%Y-%m-%d").date()
-    st.write(f"Chosen expiry: **{expiry}** (DTE={(ed - date.today()).days})")
-
-    try:
-        opt = tkr.option_chain(expiry)
-    except YFRateLimitError:
-        st.warning("Yahoo rate-limited the options chain. Try again in a minute.")
-        st.stop()
-    except Exception as e:
-        st.error(f"Options chain error: {e}")
-        st.stop()
-
-    calls_e = enrich_chain_with_delta(opt.calls, S=spot, expiry=expiry, r=float(r_rate), is_call=True)
-    puts_e = enrich_chain_with_delta(opt.puts, S=spot, expiry=expiry, r=float(r_rate), is_call=False)
-
+def build_strategy_for_bias(mode: str, auto_bias: str, puts_e, calls_e, target_delta: float, wing_width: float):
     if mode == "Auto":
         bias = auto_bias
     elif mode == "Bull Put":
@@ -452,35 +345,270 @@ if run:
         bias = "neutral"
 
     if mode == "Iron Condor" or bias == "neutral":
-        strat = build_iron_condor(puts_e, calls_e, float(target_delta), int(wing_steps))
-    else:
-        strat = build_vertical_credit(puts_e, calls_e, bias, float(target_delta), int(wing_steps))
+        return build_iron_condor(puts_e, calls_e, target_delta, wing_width)
+    if bias == "bullish":
+        return build_bull_put(puts_e, target_delta, wing_width)
+    if bias == "bearish":
+        return build_bear_call(calls_e, target_delta, wing_width)
+    return None
 
+# =========================
+# Watchlist state
+# =========================
+if "watchlist" not in st.session_state:
+    st.session_state.watchlist = DEFAULT_WATCHLIST.copy()
+
+# =========================
+# MAIN CONTROLS (NO SIDEBAR)
+# =========================
+st.markdown("<div class='card'>", unsafe_allow_html=True)
+
+row1 = st.columns([2.2, 1.4, 1.2, 1.2])
+with row1[0]:
+    symbol = st.selectbox("Ticker", st.session_state.watchlist, index=0)
+    add_row = st.columns([1.6, 0.8, 0.8])
+    with add_row[0]:
+        new_sym = st.text_input("Add ticker", placeholder="NFLX").strip().upper()
+    with add_row[1]:
+        if st.button("Add"):
+            if new_sym and new_sym not in st.session_state.watchlist:
+                st.session_state.watchlist.append(new_sym)
+                st.success(f"Added {new_sym}")
+                st.rerun()
+    with add_row[2]:
+        if st.button("Remove"):
+            if len(st.session_state.watchlist) > 1 and symbol in st.session_state.watchlist:
+                st.session_state.watchlist.remove(symbol)
+                st.rerun()
+
+with row1[1]:
+    mode = st.selectbox("Strategy mode", ["Auto", "Bull Put", "Bear Call", "Iron Condor"])
+    target_delta = st.slider("Target delta", 0.10, 0.35, 0.20, 0.01)
+
+with row1[2]:
+    wing_width = st.slider("Wing width ($)", 1.00, 2.50, 1.50, 0.05)
+    r_rate = st.number_input("Risk-free r", 0.0, 0.20, 0.04, 0.005)
+
+with row1[3]:
+    budget = st.number_input("Budget ($ max loss)", min_value=25.0, max_value=5000.0, value=100.0, step=25.0)
+    show_charts = st.checkbox("Show charts", value=False)
+    run = st.button("🚀 Run", type="primary", use_container_width=True)
+
+st.markdown("<hr/>", unsafe_allow_html=True)
+
+st.markdown("**Liquidity filter (applies to short/long selection)**")
+lf = st.columns([1.2, 1.2, 1.6, 1.0])
+with lf[0]:
+    min_oi = st.number_input("Min OI", min_value=0, max_value=20000, value=100, step=50)
+with lf[1]:
+    min_vol = st.number_input("Min Vol", min_value=0, max_value=20000, value=10, step=5)
+with lf[2]:
+    max_spread_pct = st.slider("Max bid/ask spread (% of mid)", 0.05, 1.50, 0.35, 0.05)
+    max_spread_pct = float(max_spread_pct)
+with lf[3]:
+    scan_limit = st.selectbox("Budget scan size", [5, 10, 15, 20], index=1)
+
+st.markdown("</div>", unsafe_allow_html=True)
+
+if not run:
+    st.write("Tap **Run** to scan trends + generate Daily/Weekly spread ideas, plus budget-based ticker suggestions.")
+    st.stop()
+
+# =========================
+# DATA + TREND SCAN (for selected symbol)
+# =========================
+with st.spinner("Fetching candles…"):
+    frames = fetch_timeframes(symbol)
+
+trend_matrix = {}
+latest_close = None
+
+st.subheader(f"{symbol} — Trend scan (15m / 4h / 1D)")
+
+for tf_name in ["15m", "4h", "1D"]:
+    df = frames.get(tf_name)
+    if df is None or df.empty:
+        trend_matrix[tf_name] = {"direction": "insufficient", "strength": 0, "regime": "", "notes": "No data"}
+        continue
+
+    df_feat = compute_features(df)
+    summ = classify_trend_adaptive(df_feat)
+    trend_matrix[tf_name] = summ
+    latest_close = float(df_feat["close"].iloc[-1])
+
+    with st.expander(f"{tf_name} — {summ['direction']} ({summ['strength']}%) | {summ['regime']} | {summ['notes']}",
+                     expanded=(tf_name == "1D")):
+        st.write(summ)
+        if show_charts:
+            import matplotlib.pyplot as plt
+            dfp = df_feat.tail(260).copy()
+            fig = plt.figure(figsize=(10, 3.5))
+            plt.plot(dfp.index, dfp["close"], label="Close")
+            for col in ["SMA20", "SMA50", "SMA200"]:
+                if col in dfp.columns and dfp[col].notna().any():
+                    plt.plot(dfp.index, dfp[col], label=col)
+            plt.title(f"{symbol} {tf_name}")
+            plt.grid(True)
+            plt.legend()
+            plt.tight_layout()
+            st.pyplot(fig, clear_figure=True)
+
+auto_bias = decide_bias(trend_matrix)
+st.info(f"Auto bias (weighted): **{auto_bias.upper()}**")
+
+# =========================
+# Options: build ideas
+# =========================
+def get_spot(tkr: yf.Ticker, fallback: float | None):
+    spot = np.nan
+    try:
+        spot = float(getattr(tkr, "fast_info", {}).get("last_price", np.nan))
+    except Exception:
+        pass
+    if not np.isfinite(spot):
+        spot = float(fallback) if fallback is not None else np.nan
+    return spot
+
+def build_idea_for_symbol(sym: str, dte_min: int, dte_max: int, return_debug: bool = False):
+    """
+    Returns dict with strategy + max_loss + expiry, or None if cannot build.
+    """
+    tkr = yf.Ticker(sym)
+    spot = get_spot(tkr, None)
+    if not np.isfinite(spot):
+        # fallback to recent daily close quickly (one call)
+        d1 = fetch_yf(sym, "1d", "10d")
+        if d1 is not None and not d1.empty:
+            spot = float(d1["close"].iloc[-1])
+    if not np.isfinite(spot):
+        return None
+
+    exps = list_expirations(tkr)
+    expiry = pick_expiration_in_window(exps, dte_min, dte_max)
+    if not expiry:
+        return None
+
+    try:
+        chain = tkr.option_chain(expiry)
+    except Exception:
+        return None
+
+    calls_e = enrich_chain_with_delta(chain.calls, S=spot, expiry=expiry, r=float(r_rate), is_call=True)
+    puts_e  = enrich_chain_with_delta(chain.puts,  S=spot, expiry=expiry, r=float(r_rate), is_call=False)
+
+    # Apply liquidity filters
+    calls_f = apply_liquidity_filter(calls_e, int(min_oi), int(min_vol), float(max_spread_pct))
+    puts_f  = apply_liquidity_filter(puts_e,  int(min_oi), int(min_vol), float(max_spread_pct))
+
+    strat = build_strategy_for_bias(mode, auto_bias, puts_f, calls_f, float(target_delta), float(wing_width))
     if not strat:
-        st.error("Could not construct a strategy. Try different DTE/Δ/Wings.")
-        st.stop()
+        return None
 
-    st.success(f"Recommended: **{strat['name']}**")
+    max_loss = strat.get("max_loss", np.nan)
+    if not np.isfinite(max_loss):
+        return None
 
+    # Convert per-share to per-spread (x100)
+    max_loss_dollars = max_loss * 100.0
+    credit_dollars = (strat.get("credit", np.nan) * 100.0) if np.isfinite(strat.get("credit", np.nan)) else np.nan
+
+    out = {
+        "symbol": sym,
+        "spot": spot,
+        "expiry": expiry,
+        "name": strat["name"],
+        "legs": strat["legs"],
+        "credit_$": credit_dollars,
+        "max_loss_$": max_loss_dollars,
+        "width": strat.get("width", np.nan),
+    }
+    if return_debug:
+        out["calls_rows"] = len(calls_f)
+        out["puts_rows"] = len(puts_f)
+    return out
+
+def render_idea(title: str, idea: dict | None, dte_min: int, dte_max: int):
+    st.markdown(f"<div class='card'><b>{title}</b><div class='small-muted'>DTE window: {dte_min}–{dte_max}</div>", unsafe_allow_html=True)
+    if idea is None:
+        st.write("No valid spread found (liquidity filter too strict, no expirations, or chain missing).")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    st.write(f"Expiry: **{idea['expiry']}** | Spot: **{idea['spot']:.2f}**")
+    st.success(f"Recommended: **{idea['name']}**")
     st.markdown("**Legs**")
-    for leg in strat["legs"]:
+    for leg in idea["legs"]:
         st.write(f"- {leg[0]} {leg[1]}")
 
-    credit = strat.get("credit", np.nan)
-    width = strat.get("width", np.nan)
-    max_loss = strat.get("max_loss", np.nan)
-
     st.markdown("**Estimates (mid-based)**")
-    st.write(f"- Est credit: **{credit:.2f}**" if np.isfinite(credit) else "- Est credit: unavailable")
-    if np.isfinite(width):
-        st.write(f"- Width: **{width:.2f}**")
-    if np.isfinite(max_loss):
-        st.write(f"- Est max loss/share: **{max_loss:.2f}** (x100 per spread)")
+    if np.isfinite(idea["credit_$"]):
+        st.write(f"- Est credit: **${idea['credit_$']:.0f}**")
+    else:
+        st.write("- Est credit: unavailable")
+    st.write(f"- Est max loss: **${idea['max_loss_$']:.0f}**")
 
-    if strat["name"] == "Iron Condor":
-        if np.isfinite(strat.get("put_credit", np.nan)) and np.isfinite(strat.get("call_credit", np.nan)):
-            st.write(f"- Put credit: {strat['put_credit']:.2f} | Call credit: {strat['call_credit']:.2f}")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    st.caption("Educational only — not investment advice.")
-else:
-    st.write("Pick a ticker from the dropdown, set your spread settings, then tap **Run Scan**.")
+st.subheader("Spread Ideas (Daily + Weekly)")
+
+daily_col, weekly_col = st.columns(2)
+
+with daily_col:
+    daily = build_idea_for_symbol(symbol, 0, 2)
+    render_idea("📅 Daily Spread Idea", daily, 0, 2)
+
+with weekly_col:
+    weekly = build_idea_for_symbol(symbol, 5, 12)
+    render_idea("🗓️ Weekly Spread Idea", weekly, 5, 12)
+
+# =========================
+# Budget-based ticker suggestions
+# =========================
+st.subheader("Budget-based Ticker Picker")
+
+st.write(
+    f"Budget = **${budget:.0f}** max loss per spread (x100). "
+    f"Filters: OI≥{int(min_oi)}, Vol≥{int(min_vol)}, spread%≤{max_spread_pct:.2f}."
+)
+
+cands = st.session_state.watchlist[: int(scan_limit)]
+
+pickA, pickB = st.columns(2)
+
+with pickA:
+    st.markdown("**Daily (0–2 DTE) — best under budget**")
+    rows = []
+    for sym in cands:
+        idea = build_idea_for_symbol(sym, 0, 2)
+        if idea and idea["max_loss_$"] <= budget:
+            rows.append(idea)
+        time.sleep(0.15)
+    if rows:
+        df = pd.DataFrame(rows).sort_values(["max_loss_$", "credit_$"], ascending=[True, False])
+        st.dataframe(
+            df[["symbol", "expiry", "name", "max_loss_$", "credit_$", "spot"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.write("No daily candidates found under budget with current filters.")
+
+with pickB:
+    st.markdown("**Weekly (5–12 DTE) — best under budget**")
+    rows = []
+    for sym in cands:
+        idea = build_idea_for_symbol(sym, 5, 12)
+        if idea and idea["max_loss_$"] <= budget:
+            rows.append(idea)
+        time.sleep(0.15)
+    if rows:
+        df = pd.DataFrame(rows).sort_values(["max_loss_$", "credit_$"], ascending=[True, False])
+        st.dataframe(
+            df[["symbol", "expiry", "name", "max_loss_$", "credit_$", "spot"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.write("No weekly candidates found under budget with current filters.")
+
+st.caption("Educational only — not investment advice.")
