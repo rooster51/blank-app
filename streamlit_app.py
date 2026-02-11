@@ -16,16 +16,16 @@ from scipy.stats import norm
 st.set_page_config(page_title="Trend + Credit Spreads", layout="wide")
 
 TZ = "America/New_York"
-DEFAULT_WATCHLIST = ["NVDA", "AAPL", "MSFT", "SPY", "QQQ", "TSLA", "AMD", "META", "AMZN", "GOOGL", "IWM", "XLF", "BAC", "F"]
+DEFAULT_WATCHLIST = ["NVDA", "AAPL", "MSFT", "SPY", "QQQ", "TSLA", "AMD", "META", "AMZN", "GOOGL"]
 
 # =========================
-# Styling (dark-friendly)
+# Styling (dark-friendly, minimal)
 # =========================
 st.markdown(
     """
 <style>
 .block-container { max-width: 1180px; padding-top: 1.0rem; padding-bottom: 2.5rem; }
-.small-muted { opacity: 0.8; font-size: 0.92rem; }
+.small-muted { opacity: 0.80; font-size: 0.92rem; }
 .card { border: 1px solid rgba(255,255,255,0.12); border-radius: 14px; padding: 14px; background: rgba(255,255,255,0.03); }
 hr { border: none; border-top: 1px solid rgba(255,255,255,0.12); margin: 0.75rem 0; }
 </style>
@@ -37,7 +37,7 @@ st.title("📈 Trend Scanner → Credit Spread Builder")
 st.caption("Educational only. Options trading involves substantial risk (assignment, gap risk, liquidity).")
 
 # =========================
-# Indicators / Trend
+# Trend indicators
 # =========================
 def sma(s: pd.Series, n: int) -> pd.Series:
     return s.rolling(n).mean()
@@ -58,6 +58,11 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 def classify_trend_adaptive(df: pd.DataFrame) -> dict:
+    """
+    Adaptive trend:
+    - Uses SMA200 if available, otherwise falls back to SMA20/50.
+    This prevents 4H from failing due to not having 200+ bars.
+    """
     if df is None or df.empty or len(df) < 60:
         return {"direction": "insufficient", "strength": 0, "regime": "", "notes": "Need ~60+ bars"}
 
@@ -124,7 +129,7 @@ def decide_bias(trend_matrix: dict) -> str:
     return "neutral"
 
 # =========================
-# Data fetch (yfinance + backoff)
+# Data fetch (rate-safe)
 # =========================
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_yf(symbol: str, interval: str, period: str) -> pd.DataFrame | None:
@@ -186,11 +191,6 @@ def enrich_chain_with_delta(chain_df: pd.DataFrame, S: float, expiry: str, r: fl
     ask = df.get("ask", pd.Series(np.nan, index=df.index))
     df["mid"] = np.where(np.isfinite(bid) & np.isfinite(ask) & (ask > 0), (bid + ask) / 2.0, np.nan)
 
-    # spread % relative to mid
-    df["spread_abs"] = (ask - bid)
-    df["spread_pct"] = np.where(np.isfinite(df["mid"]) & (df["mid"] > 0),
-                                (df["spread_abs"] / df["mid"]), np.nan)
-
     deltas = []
     for _, row in df.iterrows():
         K = float(row.get("strike", np.nan))
@@ -226,34 +226,13 @@ def pick_expiration_in_window(exps: list[str], dte_min: int, dte_max: int):
     target = int(round((dte_min + dte_max) / 2))
     return sorted(candidates, key=lambda x: abs(x[0] - target))[0][1]
 
-def apply_liquidity_filter(df: pd.DataFrame, min_oi: int, min_vol: int, max_spread_pct: float):
-    """
-    Filters option chain rows by OI/volume/spread%.
-    Uses columns: openInterest, volume, spread_pct, mid.
-    """
-    x = df.copy()
-    if "openInterest" not in x.columns:
-        x["openInterest"] = 0
-    if "volume" not in x.columns:
-        x["volume"] = 0
-
-    cond = (
-        (x["openInterest"].fillna(0) >= min_oi) &
-        (x["volume"].fillna(0) >= min_vol) &
-        (x["mid"].notna()) &
-        (x["spread_pct"].fillna(np.inf) <= max_spread_pct)
-    )
-    return x[cond].copy()
-
 def pick_short_by_delta(df: pd.DataFrame, target_delta: float, want_call: bool):
     d_target = target_delta if want_call else -target_delta
     x = df.dropna(subset=["delta_est", "strike"]).copy()
     if x.empty:
         return None
     x["err"] = (x["delta_est"] - d_target).abs()
-    # prefer tighter spreads if tie-ish
-    x["rank"] = x["err"] + 0.05 * x["spread_pct"].fillna(1.0)
-    return x.sort_values("rank").iloc[0]
+    return x.sort_values("err").iloc[0]
 
 def pick_wing_by_width(df: pd.DataFrame, short_strike: float, wing_width: float, want_call: bool):
     x = df.dropna(subset=["strike"]).copy()
@@ -364,6 +343,7 @@ if "watchlist" not in st.session_state:
 st.markdown("<div class='card'>", unsafe_allow_html=True)
 
 row1 = st.columns([2.2, 1.4, 1.2, 1.2])
+
 with row1[0]:
     symbol = st.selectbox("Ticker", st.session_state.watchlist, index=0)
     add_row = st.columns([1.6, 0.8, 0.8])
@@ -390,32 +370,17 @@ with row1[2]:
     r_rate = st.number_input("Risk-free r", 0.0, 0.20, 0.04, 0.005)
 
 with row1[3]:
-    budget = st.number_input("Budget ($ max loss)", min_value=25.0, max_value=5000.0, value=100.0, step=25.0)
-    show_charts = st.checkbox("Show charts", value=False)
+    show_charts = st.checkbox("Show charts", value=True)
     run = st.button("🚀 Run", type="primary", use_container_width=True)
-
-st.markdown("<hr/>", unsafe_allow_html=True)
-
-st.markdown("**Liquidity filter (applies to short/long selection)**")
-lf = st.columns([1.2, 1.2, 1.6, 1.0])
-with lf[0]:
-    min_oi = st.number_input("Min OI", min_value=0, max_value=20000, value=100, step=50)
-with lf[1]:
-    min_vol = st.number_input("Min Vol", min_value=0, max_value=20000, value=10, step=5)
-with lf[2]:
-    max_spread_pct = st.slider("Max bid/ask spread (% of mid)", 0.05, 1.50, 0.35, 0.05)
-    max_spread_pct = float(max_spread_pct)
-with lf[3]:
-    scan_limit = st.selectbox("Budget scan size", [5, 10, 15, 20], index=1)
 
 st.markdown("</div>", unsafe_allow_html=True)
 
 if not run:
-    st.write("Tap **Run** to scan trends + generate Daily/Weekly spread ideas, plus budget-based ticker suggestions.")
+    st.write("Tap **Run** to scan trends and generate Daily/Weekly spread ideas.")
     st.stop()
 
 # =========================
-# DATA + TREND SCAN (for selected symbol)
+# DATA + TREND SCAN
 # =========================
 with st.spinner("Fetching candles…"):
     frames = fetch_timeframes(symbol)
@@ -436,9 +401,10 @@ for tf_name in ["15m", "4h", "1D"]:
     trend_matrix[tf_name] = summ
     latest_close = float(df_feat["close"].iloc[-1])
 
-    with st.expander(f"{tf_name} — {summ['direction']} ({summ['strength']}%) | {summ['regime']} | {summ['notes']}",
-                     expanded=(tf_name == "1D")):
-        st.write(summ)
+    with st.expander(
+        f"{tf_name} — {summ['direction']} ({summ['strength']}%) | {summ['regime']} | {summ['notes']}",
+        expanded=True,
+    ):
         if show_charts:
             import matplotlib.pyplot as plt
             dfp = df_feat.tail(260).copy()
@@ -452,163 +418,95 @@ for tf_name in ["15m", "4h", "1D"]:
             plt.legend()
             plt.tight_layout()
             st.pyplot(fig, clear_figure=True)
+        st.write(summ)
 
 auto_bias = decide_bias(trend_matrix)
 st.info(f"Auto bias (weighted): **{auto_bias.upper()}**")
 
 # =========================
-# Options: build ideas
+# Options: Daily + Weekly ideas
 # =========================
-def get_spot(tkr: yf.Ticker, fallback: float | None):
-    spot = np.nan
-    try:
-        spot = float(getattr(tkr, "fast_info", {}).get("last_price", np.nan))
-    except Exception:
-        pass
-    if not np.isfinite(spot):
-        spot = float(fallback) if fallback is not None else np.nan
-    return spot
+st.subheader("Options chain → spread ideas (Daily + Weekly)")
 
-def build_idea_for_symbol(sym: str, dte_min: int, dte_max: int, return_debug: bool = False):
-    """
-    Returns dict with strategy + max_loss + expiry, or None if cannot build.
-    """
-    tkr = yf.Ticker(sym)
-    spot = get_spot(tkr, None)
-    if not np.isfinite(spot):
-        # fallback to recent daily close quickly (one call)
-        d1 = fetch_yf(sym, "1d", "10d")
-        if d1 is not None and not d1.empty:
-            spot = float(d1["close"].iloc[-1])
-    if not np.isfinite(spot):
-        return None
+tkr = yf.Ticker(symbol)
 
-    exps = list_expirations(tkr)
+spot = np.nan
+try:
+    spot = float(getattr(tkr, "fast_info", {}).get("last_price", np.nan))
+except Exception:
+    pass
+if not np.isfinite(spot):
+    spot = float(latest_close) if latest_close is not None else np.nan
+
+if not np.isfinite(spot):
+    st.error("Spot price unavailable.")
+    st.stop()
+
+st.write(f"Spot: **{spot:.2f}**")
+
+exps = list_expirations(tkr)
+if not exps:
+    st.error("No options expirations found (or Yahoo options unavailable).")
+    st.stop()
+
+def build_idea_block(title: str, dte_min: int, dte_max: int):
+    st.markdown(f"<div class='card'><b>{title}</b><div class='small-muted'>DTE window: {dte_min}–{dte_max}</div>", unsafe_allow_html=True)
+
     expiry = pick_expiration_in_window(exps, dte_min, dte_max)
     if not expiry:
-        return None
+        st.write("No expiration found in this DTE window for this symbol.")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    ed = datetime.strptime(expiry, "%Y-%m-%d").date()
+    dte = (ed - date.today()).days
+    st.write(f"Chosen expiry: **{expiry}** (DTE={dte})")
 
     try:
         chain = tkr.option_chain(expiry)
-    except Exception:
-        return None
+    except YFRateLimitError:
+        st.write("Yahoo rate-limited the options chain. Try again in ~30–60 seconds.")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+    except Exception as e:
+        st.write(f"Options chain error: {e}")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
 
     calls_e = enrich_chain_with_delta(chain.calls, S=spot, expiry=expiry, r=float(r_rate), is_call=True)
     puts_e  = enrich_chain_with_delta(chain.puts,  S=spot, expiry=expiry, r=float(r_rate), is_call=False)
 
-    # Apply liquidity filters
-    calls_f = apply_liquidity_filter(calls_e, int(min_oi), int(min_vol), float(max_spread_pct))
-    puts_f  = apply_liquidity_filter(puts_e,  int(min_oi), int(min_vol), float(max_spread_pct))
-
-    strat = build_strategy_for_bias(mode, auto_bias, puts_f, calls_f, float(target_delta), float(wing_width))
+    strat = build_strategy_for_bias(mode, auto_bias, puts_e, calls_e, float(target_delta), float(wing_width))
     if not strat:
-        return None
-
-    max_loss = strat.get("max_loss", np.nan)
-    if not np.isfinite(max_loss):
-        return None
-
-    # Convert per-share to per-spread (x100)
-    max_loss_dollars = max_loss * 100.0
-    credit_dollars = (strat.get("credit", np.nan) * 100.0) if np.isfinite(strat.get("credit", np.nan)) else np.nan
-
-    out = {
-        "symbol": sym,
-        "spot": spot,
-        "expiry": expiry,
-        "name": strat["name"],
-        "legs": strat["legs"],
-        "credit_$": credit_dollars,
-        "max_loss_$": max_loss_dollars,
-        "width": strat.get("width", np.nan),
-    }
-    if return_debug:
-        out["calls_rows"] = len(calls_f)
-        out["puts_rows"] = len(puts_f)
-    return out
-
-def render_idea(title: str, idea: dict | None, dte_min: int, dte_max: int):
-    st.markdown(f"<div class='card'><b>{title}</b><div class='small-muted'>DTE window: {dte_min}–{dte_max}</div>", unsafe_allow_html=True)
-    if idea is None:
-        st.write("No valid spread found (liquidity filter too strict, no expirations, or chain missing).")
+        st.write("Could not construct a spread (missing IV/mids/strikes). Try a different delta or wing width.")
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    st.write(f"Expiry: **{idea['expiry']}** | Spot: **{idea['spot']:.2f}**")
-    st.success(f"Recommended: **{idea['name']}**")
+    st.success(f"Recommended: **{strat['name']}**")
+
     st.markdown("**Legs**")
-    for leg in idea["legs"]:
+    for leg in strat["legs"]:
         st.write(f"- {leg[0]} {leg[1]}")
 
+    credit = strat.get("credit", np.nan)
+    max_loss = strat.get("max_loss", np.nan)
+
     st.markdown("**Estimates (mid-based)**")
-    if np.isfinite(idea["credit_$"]):
-        st.write(f"- Est credit: **${idea['credit_$']:.0f}**")
-    else:
-        st.write("- Est credit: unavailable")
-    st.write(f"- Est max loss: **${idea['max_loss_$']:.0f}**")
+    st.write(f"- Est credit: **{credit:.2f}**" if np.isfinite(credit) else "- Est credit: unavailable")
+    st.write(f"- Est max loss/share: **{max_loss:.2f}** (x100/contract)" if np.isfinite(max_loss) else "- Est max loss: unavailable")
+
+    if strat["name"] == "Iron Condor":
+        pc = strat.get("put_credit", np.nan)
+        cc = strat.get("call_credit", np.nan)
+        if np.isfinite(pc) and np.isfinite(cc):
+            st.write(f"- Put credit: {pc:.2f} | Call credit: {cc:.2f}")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-st.subheader("Spread Ideas (Daily + Weekly)")
-
-daily_col, weekly_col = st.columns(2)
-
-with daily_col:
-    daily = build_idea_for_symbol(symbol, 0, 2)
-    render_idea("📅 Daily Spread Idea", daily, 0, 2)
-
-with weekly_col:
-    weekly = build_idea_for_symbol(symbol, 5, 12)
-    render_idea("🗓️ Weekly Spread Idea", weekly, 5, 12)
-
-# =========================
-# Budget-based ticker suggestions
-# =========================
-st.subheader("Budget-based Ticker Picker")
-
-st.write(
-    f"Budget = **${budget:.0f}** max loss per spread (x100). "
-    f"Filters: OI≥{int(min_oi)}, Vol≥{int(min_vol)}, spread%≤{max_spread_pct:.2f}."
-)
-
-cands = st.session_state.watchlist[: int(scan_limit)]
-
-pickA, pickB = st.columns(2)
-
-with pickA:
-    st.markdown("**Daily (0–2 DTE) — best under budget**")
-    rows = []
-    for sym in cands:
-        idea = build_idea_for_symbol(sym, 0, 2)
-        if idea and idea["max_loss_$"] <= budget:
-            rows.append(idea)
-        time.sleep(0.15)
-    if rows:
-        df = pd.DataFrame(rows).sort_values(["max_loss_$", "credit_$"], ascending=[True, False])
-        st.dataframe(
-            df[["symbol", "expiry", "name", "max_loss_$", "credit_$", "spot"]],
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
-        st.write("No daily candidates found under budget with current filters.")
-
-with pickB:
-    st.markdown("**Weekly (5–12 DTE) — best under budget**")
-    rows = []
-    for sym in cands:
-        idea = build_idea_for_symbol(sym, 5, 12)
-        if idea and idea["max_loss_$"] <= budget:
-            rows.append(idea)
-        time.sleep(0.15)
-    if rows:
-        df = pd.DataFrame(rows).sort_values(["max_loss_$", "credit_$"], ascending=[True, False])
-        st.dataframe(
-            df[["symbol", "expiry", "name", "max_loss_$", "credit_$", "spot"]],
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
-        st.write("No weekly candidates found under budget with current filters.")
+colA, colB = st.columns(2)
+with colA:
+    build_idea_block("📅 Daily Spread Idea", 0, 2)
+with colB:
+    build_idea_block("🗓️ Weekly Spread Idea", 5, 12)
 
 st.caption("Educational only — not investment advice.")
