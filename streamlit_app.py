@@ -1,10 +1,14 @@
 import os
 import math
-from datetime import datetime, date, timezone
+import time
+import random
+from datetime import datetime, date
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+import yfinance as yf
+from yfinance.exceptions import YFRateLimitError
 import requests
 from scipy.stats import norm
 
@@ -13,7 +17,6 @@ from scipy.stats import norm
 # =========================
 st.set_page_config(page_title="Trend + Credit Spreads", layout="wide")
 TZ = "America/New_York"
-
 DEFAULT_WATCHLIST = ["NVDA", "AAPL", "MSFT", "SPY", "QQQ", "TSLA", "AMD", "META", "AMZN", "GOOGL"]
 
 MD_BASE = "https://api.marketdata.app/v1"
@@ -36,7 +39,7 @@ st.title("📈 Trend Scanner → Credit Spread Builder")
 st.caption("Educational only. Options trading involves substantial risk (assignment, gap risk, liquidity).")
 
 # =========================
-# Token handling
+# MarketData token
 # =========================
 def get_marketdata_token() -> str:
     try:
@@ -66,6 +69,51 @@ def md_get_json(url: str, params: dict | None = None) -> dict | None:
         return {"s": "error", "errmsg": f"Request error: {e}"}
 
 # =========================
+# Candles: yfinance (reliable for charts)
+# =========================
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_yf(symbol: str, interval: str, period: str) -> pd.DataFrame | None:
+    tkr = yf.Ticker(symbol)
+    for attempt in range(5):
+        try:
+            hist = tkr.history(period=period, interval=interval, auto_adjust=False)
+            if hist is None or hist.empty:
+                return None
+            df = hist.rename(
+                columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
+            )[["open", "high", "low", "close", "volume"]].copy()
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("UTC")
+            df.index = df.index.tz_convert(TZ)
+            df.index.name = "time"
+            return df
+        except YFRateLimitError:
+            time.sleep((2 ** attempt) + random.uniform(0, 0.8))
+        except Exception:
+            return None
+    return None
+
+def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    out = pd.DataFrame(
+        {
+            "open": df["open"].resample(rule).first(),
+            "high": df["high"].resample(rule).max(),
+            "low": df["low"].resample(rule).min(),
+            "close": df["close"].resample(rule).last(),
+            "volume": df["volume"].resample(rule).sum(),
+        }
+    ).dropna()
+    out.index.name = "time"
+    return out
+
+def fetch_timeframes(symbol: str):
+    # 15m needs enough bars for SMA50-ish; 60d works well
+    df_15m = fetch_yf(symbol, "15m", "60d")
+    df_4h = resample_ohlcv(df_15m, "4H") if df_15m is not None and not df_15m.empty else None
+    df_1d = fetch_yf(symbol, "1d", "3y")
+    return {"15m": df_15m, "4h": df_4h, "1D": df_1d}
+
+# =========================
 # Indicators / Trend
 # =========================
 def sma(s: pd.Series, n: int) -> pd.Series:
@@ -87,25 +135,22 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 def classify_trend_adaptive(df: pd.DataFrame) -> dict:
-    # Allows trend reading even if SMA200 not present
-    if df is None or df.empty or len(df) < 60:
-        return {"direction": "insufficient", "strength": 0, "regime": "", "notes": "Need ~60+ bars"}
+    # don’t require 200 bars; require enough for SMA50 and stable RSI
+    if df is None or df.empty or len(df) < 80:
+        return {"direction": "insufficient", "strength": 0, "regime": "", "notes": f"Need ~80+ bars (have {0 if df is None else len(df)})"}
 
     last = df.iloc[-1]
     close = float(last["close"])
     r = float(last["RSI14"]) if pd.notna(last["RSI14"]) else 50.0
-
     s20 = last.get("SMA20", np.nan)
     s50 = last.get("SMA50", np.nan)
     s200 = last.get("SMA200", np.nan)
 
-    has_50 = pd.notna(s20) and pd.notna(s50)
     has_200 = pd.notna(s200)
-
     direction = "neutral"
     strength = 45
 
-    if has_50:
+    if pd.notna(s20) and pd.notna(s50):
         if has_200:
             if s20 > s50 > s200 and close > s20:
                 direction, strength = "bullish", 80
@@ -118,6 +163,7 @@ def classify_trend_adaptive(df: pd.DataFrame) -> dict:
             else:
                 direction, strength = "neutral", 45
         else:
+            # 15m/4h often won’t have SMA200. Use 20/50 only.
             if s20 > s50 and close > s20:
                 direction, strength = "bullish", 65
             elif s20 > s50:
@@ -155,85 +201,8 @@ def decide_bias(trend_matrix: dict) -> str:
     return "neutral"
 
 # =========================
-# MarketData Candles
+# MarketData options (expirations + chain)
 # =========================
-@st.cache_data(ttl=600, show_spinner=False)
-def md_candles(symbol: str, interval: str, lookback_days: int) -> pd.DataFrame | None:
-    """
-    Uses MarketData candles endpoint.
-    NOTE: Endpoint/path/params may vary slightly by plan. If your plan returns different keys,
-    we normalize for common 't/o/h/l/c/v' style arrays.
-    """
-    end = datetime.now(timezone.utc)
-    start = end - pd.Timedelta(days=lookback_days)
-    params = {
-        "interval": interval,                       # e.g. "15m", "1d"
-        "from": int(start.timestamp()),
-        "to": int(end.timestamp()),
-    }
-    j = md_get_json(f"{MD_BASE}/stocks/candles/{symbol}/", params=params)
-    if not isinstance(j, dict) or j.get("s") != "ok":
-        return None
-
-    # Common response patterns: arrays for t/o/h/l/c/v
-    # We handle a few key variants defensively.
-    t = j.get("t") or j.get("time") or j.get("timestamp")
-    o = j.get("o") or j.get("open")
-    h = j.get("h") or j.get("high")
-    l = j.get("l") or j.get("low")
-    c = j.get("c") or j.get("close")
-    v = j.get("v") or j.get("volume")
-
-    if not (isinstance(t, list) and isinstance(c, list)) or len(t) == 0:
-        return None
-
-    df = pd.DataFrame({"open": o, "high": h, "low": l, "close": c, "volume": v})
-    idx = pd.to_datetime(pd.Series(t), unit="s", utc=True).dt.tz_convert(TZ)
-    df.index = idx
-    df.index.name = "time"
-    return df.dropna()
-
-def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    out = pd.DataFrame(
-        {
-            "open": df["open"].resample(rule).first(),
-            "high": df["high"].resample(rule).max(),
-            "low": df["low"].resample(rule).min(),
-            "close": df["close"].resample(rule).last(),
-            "volume": df["volume"].resample(rule).sum(),
-        }
-    ).dropna()
-    out.index.name = "time"
-    return out
-
-def fetch_timeframes(symbol: str):
-    # 15m: ~60 days
-    df_15m = md_candles(symbol, interval="15m", lookback_days=60)
-    # 4h: resample from 15m (stable + consistent)
-    df_4h = resample_ohlcv(df_15m, "4H") if df_15m is not None and not df_15m.empty else None
-    # 1D: ~3y
-    df_1d = md_candles(symbol, interval="1d", lookback_days=365 * 3)
-    return {"15m": df_15m, "4h": df_4h, "1D": df_1d}
-
-# =========================
-# MarketData Options
-# =========================
-@st.cache_data(ttl=600, show_spinner=False)
-def md_stock_quote(symbol: str) -> float | None:
-    j = md_get_json(f"{MD_BASE}/stocks/quotes/{symbol}/")
-    if not isinstance(j, dict) or j.get("s") != "ok":
-        return None
-    for key in ("last", "mid", "Last", "Mid"):
-        v = j.get(key, None)
-        if isinstance(v, list) and v:
-            try:
-                return float(v[-1])
-            except Exception:
-                pass
-        if isinstance(v, (int, float)):
-            return float(v)
-    return None
-
 @st.cache_data(ttl=1800, show_spinner=False)
 def md_options_expirations(symbol: str) -> list[str] | None:
     j = md_get_json(f"{MD_BASE}/options/expirations/{symbol}/")
@@ -257,10 +226,14 @@ def md_option_chain(symbol: str, expiration: str, side: str) -> pd.DataFrame | N
             df[c] = np.nan
     for c in ("strike", "bid", "ask", "mid", "iv", "delta"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
+    # compute mid if missing
+    if not df["mid"].notna().any():
+        df["mid"] = np.where(np.isfinite(df["bid"]) & np.isfinite(df["ask"]) & (df["ask"] > 0),
+                             (df["bid"] + df["ask"]) / 2.0, np.nan)
     return df
 
 # =========================
-# Spread logic
+# Spread / delta helpers
 # =========================
 def bs_delta(S, K, T, r, sigma, is_call: bool):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
@@ -282,13 +255,6 @@ def ensure_delta(df: pd.DataFrame, spot: float, expiry: str, r: float, is_call: 
             else np.nan
             for k, iv in zip(out["strike"].values, out["iv"].values)
         ]
-
-    if "mid" not in out.columns or not out["mid"].notna().any():
-        out["mid"] = np.where(
-            np.isfinite(out["bid"]) & np.isfinite(out["ask"]) & (out["ask"] > 0),
-            (out["bid"] + out["ask"]) / 2.0,
-            np.nan,
-        )
     return out
 
 def pick_short_by_delta(df: pd.DataFrame, target_delta: float, want_call: bool):
@@ -304,6 +270,7 @@ def pick_wing_by_width(df: pd.DataFrame, short_strike: float, wing_width: float,
     strikes = np.array(sorted(x["strike"].unique()))
     if len(strikes) < 2:
         return None
+
     if want_call:
         target = short_strike + wing_width
         cand = strikes[strikes > short_strike]
@@ -316,6 +283,7 @@ def pick_wing_by_width(df: pd.DataFrame, short_strike: float, wing_width: float,
         if len(cand) == 0:
             return None
         chosen = cand[np.argmin(np.abs(cand - target))]
+
     row = x[x["strike"] == chosen]
     return row.iloc[0] if not row.empty else None
 
@@ -335,7 +303,7 @@ def build_bull_put(puts_e, target_delta: float, wing_width: float):
     max_loss = (width - credit) if np.isfinite(credit) else np.nan
     return {"name": "Bull Put Spread",
             "legs": [("SELL PUT", float(short["strike"])), ("BUY PUT", float(long["strike"]))],
-            "credit": credit, "width": width, "max_loss": max_loss}
+            "credit": credit, "max_loss": max_loss}
 
 def build_bear_call(calls_e, target_delta: float, wing_width: float):
     short = pick_short_by_delta(calls_e, target_delta, want_call=True)
@@ -349,7 +317,7 @@ def build_bear_call(calls_e, target_delta: float, wing_width: float):
     max_loss = (width - credit) if np.isfinite(credit) else np.nan
     return {"name": "Bear Call Spread",
             "legs": [("SELL CALL", float(short["strike"])), ("BUY CALL", float(long["strike"]))],
-            "credit": credit, "width": width, "max_loss": max_loss}
+            "credit": credit, "max_loss": max_loss}
 
 def build_iron_condor(puts_e, calls_e, target_delta: float, wing_width: float):
     sp = pick_short_by_delta(puts_e, target_delta, want_call=False)
@@ -361,22 +329,21 @@ def build_iron_condor(puts_e, calls_e, target_delta: float, wing_width: float):
     if lp is None or lc is None:
         return None
 
-    spk, lpk = float(sp["strike"]), float(lp["strike"])
-    sck, lck = float(sc["strike"]), float(lc["strike"])
-
     put_credit = safe_mid(sp) - safe_mid(lp)
     call_credit = safe_mid(sc) - safe_mid(lc)
     total_credit = (put_credit + call_credit) if np.isfinite(put_credit) and np.isfinite(call_credit) else np.nan
 
-    put_w = abs(spk - lpk)
-    call_w = abs(lck - sck)
-    max_w = max(put_w, call_w)
-    max_loss = (max_w - total_credit) if np.isfinite(total_credit) else np.nan
+    max_loss = np.nan
+    if np.isfinite(total_credit):
+        put_w = abs(float(sp["strike"]) - float(lp["strike"]))
+        call_w = abs(float(lc["strike"]) - float(sc["strike"]))
+        max_w = max(put_w, call_w)
+        max_loss = max_w - total_credit
 
     return {"name": "Iron Condor",
-            "legs": [("SELL PUT", spk), ("BUY PUT", lpk), ("SELL CALL", sck), ("BUY CALL", lck)],
-            "credit": total_credit, "width": max_w, "max_loss": max_loss,
-            "put_credit": put_credit, "call_credit": call_credit}
+            "legs": [("SELL PUT", float(sp["strike"])), ("BUY PUT", float(lp["strike"])),
+                     ("SELL CALL", float(sc["strike"])), ("BUY CALL", float(lc["strike"]))],
+            "credit": total_credit, "max_loss": max_loss}
 
 def build_strategy(mode: str, auto_bias: str, puts_e, calls_e, target_delta: float, wing_width: float):
     if mode == "Auto":
@@ -419,11 +386,8 @@ def pick_expiration_in_dte_window(expirations: list[str], dte_min: int, dte_max:
 if "watchlist" not in st.session_state:
     st.session_state.watchlist = DEFAULT_WATCHLIST.copy()
 
-if not get_marketdata_token():
-    st.warning("Add MARKETDATA_TOKEN in Streamlit Secrets to enable MarketData candles + options.")
-
 # =========================
-# Controls (form)
+# Controls (no sidebar, runs only on submit)
 # =========================
 st.markdown("<div class='card'>", unsafe_allow_html=True)
 
@@ -468,7 +432,7 @@ if not run:
     st.stop()
 
 # =========================
-# Trend scan (MarketData candles)
+# Trend scan
 # =========================
 with st.spinner("Fetching candles…"):
     frames = fetch_timeframes(symbol)
@@ -520,12 +484,15 @@ if skip_options:
     st.info("Options skipped (charts only).")
     st.stop()
 
+if not get_marketdata_token():
+    st.error("MARKETDATA_TOKEN missing. Add it in Streamlit Secrets to use MarketData options.")
+    st.stop()
+
 st.subheader("Options chain → spread ideas (Daily + Weekly)")
 
-spot = md_stock_quote(symbol)
-if spot is None and latest_close is not None:
-    spot = float(latest_close)
-if spot is None or not np.isfinite(spot):
+# spot: use latest_close from candles (fast + stable)
+spot = float(latest_close) if latest_close is not None else np.nan
+if not np.isfinite(spot):
     st.error("Spot price unavailable.")
     st.stop()
 
@@ -537,10 +504,8 @@ if not expirations:
     st.stop()
 
 def render_spread_idea(title: str, dte_min: int, dte_max: int):
-    st.markdown(
-        f"<div class='card'><b>{title}</b><div class='small-muted'>DTE window: {dte_min}–{dte_max}</div>",
-        unsafe_allow_html=True,
-    )
+    st.markdown(f"<div class='card'><b>{title}</b><div class='small-muted'>DTE window: {dte_min}–{dte_max}</div>",
+                unsafe_allow_html=True)
 
     expiry = pick_expiration_in_dte_window(expirations, dte_min, dte_max)
     if not expiry:
@@ -554,7 +519,7 @@ def render_spread_idea(title: str, dte_min: int, dte_max: int):
     calls = md_option_chain(symbol, expiry, side="call")
     puts = md_option_chain(symbol, expiry, side="put")
     if calls is None or puts is None or calls.empty or puts.empty:
-        st.write("Options chain unavailable for this expiry (plan might not include quotes/greeks).")
+        st.write("Options chain unavailable for this expiry (or missing entitlements).")
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
@@ -563,12 +528,11 @@ def render_spread_idea(title: str, dte_min: int, dte_max: int):
 
     strat = build_strategy(mode, auto_bias, puts_e, calls_e, float(target_delta), float(wing_width))
     if not strat:
-        st.write("Could not construct a spread (missing mids/IV/delta/strikes). Try another delta/wing width.")
+        st.write("Could not construct a spread (missing mids/IV/delta/strikes). Try another delta/wing.")
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
     st.success(f"Recommended: **{strat['name']}**")
-
     st.markdown("**Legs**")
     for leg in strat["legs"]:
         st.write(f"- {leg[0]} {leg[1]}")
@@ -579,12 +543,6 @@ def render_spread_idea(title: str, dte_min: int, dte_max: int):
     st.markdown("**Estimates (mid-based)**")
     st.write(f"- Est credit: **{credit:.2f}**" if np.isfinite(credit) else "- Est credit: unavailable")
     st.write(f"- Est max loss/share: **{max_loss:.2f}** (x100/contract)" if np.isfinite(max_loss) else "- Est max loss: unavailable")
-
-    if strat["name"] == "Iron Condor":
-        pc = strat.get("put_credit", np.nan)
-        cc = strat.get("call_credit", np.nan)
-        if np.isfinite(pc) and np.isfinite(cc):
-            st.write(f"- Put credit: {pc:.2f} | Call credit: {cc:.2f}")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
