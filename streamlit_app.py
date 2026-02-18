@@ -9,6 +9,7 @@ import streamlit as st
 import yfinance as yf
 from yfinance.exceptions import YFRateLimitError
 from scipy.stats import norm
+import requests
 
 # =========================
 # App config
@@ -60,8 +61,8 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
 def classify_trend_adaptive(df: pd.DataFrame) -> dict:
     """
     Adaptive trend:
-    - Uses SMA200 if available, otherwise falls back to SMA20/50.
-    This prevents 4H from failing due to not having 200+ bars.
+    - Uses SMA200 if available; otherwise falls back to SMA20/50.
+    Prevents 4H from failing due to missing 200+ bars.
     """
     if df is None or df.empty or len(df) < 60:
         return {"direction": "insufficient", "strength": 0, "regime": "", "notes": "Need ~60+ bars"}
@@ -92,6 +93,7 @@ def classify_trend_adaptive(df: pd.DataFrame) -> dict:
             else:
                 direction, strength = "neutral", 45
         else:
+            # Shorter-term logic
             if s20 > s50 and close > s20:
                 direction, strength = "bullish", 65
             elif s20 > s50:
@@ -115,6 +117,7 @@ def classify_trend_adaptive(df: pd.DataFrame) -> dict:
     return {"direction": direction, "strength": strength, "regime": regime, "notes": notes}
 
 def decide_bias(trend_matrix: dict) -> str:
+    # weights: 1D strongest, 4h medium, 15m light
     score = 0
     for tf, w in [("1D", 3), ("4h", 2), ("15m", 1)]:
         d = trend_matrix.get(tf, {}).get("direction", "insufficient")
@@ -129,7 +132,7 @@ def decide_bias(trend_matrix: dict) -> str:
     return "neutral"
 
 # =========================
-# Data fetch (rate-safe)
+# Candles (yfinance + backoff)
 # =========================
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_yf(symbol: str, interval: str, period: str) -> pd.DataFrame | None:
@@ -139,9 +142,9 @@ def fetch_yf(symbol: str, interval: str, period: str) -> pd.DataFrame | None:
             hist = tkr.history(period=period, interval=interval, auto_adjust=False)
             if hist is None or hist.empty:
                 return None
-            df = hist.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})[
-                ["open","high","low","close","volume"]
-            ].copy()
+            df = hist.rename(
+                columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
+            )[["open", "high", "low", "close", "volume"]].copy()
             if df.index.tz is None:
                 df.index = df.index.tz_localize("UTC")
             df.index = df.index.tz_convert(TZ)
@@ -154,13 +157,15 @@ def fetch_yf(symbol: str, interval: str, period: str) -> pd.DataFrame | None:
     return None
 
 def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    out = pd.DataFrame({
-        "open": df["open"].resample(rule).first(),
-        "high": df["high"].resample(rule).max(),
-        "low":  df["low"].resample(rule).min(),
-        "close": df["close"].resample(rule).last(),
-        "volume": df["volume"].resample(rule).sum(),
-    }).dropna()
+    out = pd.DataFrame(
+        {
+            "open": df["open"].resample(rule).first(),
+            "high": df["high"].resample(rule).max(),
+            "low": df["low"].resample(rule).min(),
+            "close": df["close"].resample(rule).last(),
+            "volume": df["volume"].resample(rule).sum(),
+        }
+    ).dropna()
     out.index.name = "time"
     return out
 
@@ -171,7 +176,77 @@ def fetch_timeframes(symbol: str):
     return {"15m": df_15m, "4h": df_4h, "1D": df_1d}
 
 # =========================
-# Options + spread builder
+# Yahoo Options (DIRECT) — fixes Streamlit Cloud empty expirations
+# =========================
+YAHOO_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 "
+                  "(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+@st.cache_data(ttl=600, show_spinner=False)
+def yahoo_get_options_json(symbol: str, date_ts: int | None = None) -> dict | None:
+    base = f"https://query2.finance.yahoo.com/v7/finance/options/{symbol}"
+    url = base if date_ts is None else f"{base}?date={int(date_ts)}"
+    for attempt in range(6):
+        try:
+            r = requests.get(url, headers=YAHOO_HEADERS, timeout=12)
+            if r.status_code == 429:
+                time.sleep((2 ** attempt) + random.uniform(0, 0.9))
+                continue
+            if r.status_code >= 400:
+                return None
+            return r.json()
+        except Exception:
+            time.sleep(0.6 + random.uniform(0, 0.5))
+    return None
+
+def yahoo_expirations_with_ts(symbol: str) -> list[tuple[str, int]]:
+    j = yahoo_get_options_json(symbol, None)
+    try:
+        ts_list = j["optionChain"]["result"][0]["expirationDates"]
+        out = []
+        for ts in ts_list:
+            ds = datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d")
+            out.append((ds, int(ts)))
+        return out
+    except Exception:
+        return []
+
+def pick_expiration_in_window_ts(exps: list[tuple[str, int]], dte_min: int, dte_max: int) -> tuple[str, int] | None:
+    if not exps:
+        return None
+    today = date.today()
+    candidates = []
+    for ds, ts in exps:
+        try:
+            ed = datetime.strptime(ds, "%Y-%m-%d").date()
+            dte = (ed - today).days
+            if dte_min <= dte <= dte_max:
+                candidates.append((dte, ds, ts))
+        except Exception:
+            pass
+    if not candidates:
+        return None
+    target = int(round((dte_min + dte_max) / 2))
+    candidates.sort(key=lambda x: abs(x[0] - target))
+    return (candidates[0][1], candidates[0][2])
+
+def yahoo_option_chain(symbol: str, expiry_ts: int) -> tuple[pd.DataFrame, pd.DataFrame] | None:
+    j = yahoo_get_options_json(symbol, expiry_ts)
+    try:
+        opt = j["optionChain"]["result"][0]["options"][0]
+        calls = pd.DataFrame(opt.get("calls", []))
+        puts = pd.DataFrame(opt.get("puts", []))
+        if calls.empty and puts.empty:
+            return None
+        return calls, puts
+    except Exception:
+        return None
+
+# =========================
+# Options + spreads
 # =========================
 def bs_delta(S, K, T, r, sigma, is_call: bool):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
@@ -184,11 +259,20 @@ def enrich_chain_with_delta(chain_df: pd.DataFrame, S: float, expiry: str, r: fl
     T = max((ed - date.today()).days / 365.0, 1e-6)
 
     df = chain_df.copy()
+
+    # Normalize likely Yahoo field names to expected ones
+    # Yahoo returns bid/ask/strike/impliedVolatility already; keep safe.
     if "impliedVolatility" not in df.columns:
         df["impliedVolatility"] = np.nan
+    if "bid" not in df.columns:
+        df["bid"] = np.nan
+    if "ask" not in df.columns:
+        df["ask"] = np.nan
+    if "strike" not in df.columns:
+        df["strike"] = np.nan
 
-    bid = df.get("bid", pd.Series(np.nan, index=df.index))
-    ask = df.get("ask", pd.Series(np.nan, index=df.index))
+    bid = df["bid"]
+    ask = df["ask"]
     df["mid"] = np.where(np.isfinite(bid) & np.isfinite(ask) & (ask > 0), (bid + ask) / 2.0, np.nan)
 
     deltas = []
@@ -201,30 +285,6 @@ def enrich_chain_with_delta(chain_df: pd.DataFrame, S: float, expiry: str, r: fl
             deltas.append(bs_delta(S, K, T, r, iv, is_call))
     df["delta_est"] = deltas
     return df
-
-def list_expirations(tkr: yf.Ticker):
-    try:
-        return list(tkr.options) or []
-    except Exception:
-        return []
-
-def pick_expiration_in_window(exps: list[str], dte_min: int, dte_max: int):
-    if not exps:
-        return None
-    today = date.today()
-    candidates = []
-    for e in exps:
-        try:
-            ed = datetime.strptime(e, "%Y-%m-%d").date()
-            dte = (ed - today).days
-            if dte_min <= dte <= dte_max:
-                candidates.append((dte, e))
-        except Exception:
-            pass
-    if not candidates:
-        return None
-    target = int(round((dte_min + dte_max) / 2))
-    return sorted(candidates, key=lambda x: abs(x[0] - target))[0][1]
 
 def pick_short_by_delta(df: pd.DataFrame, target_delta: float, want_call: bool):
     d_target = target_delta if want_call else -target_delta
@@ -270,8 +330,8 @@ def build_bull_put(puts_e, target_delta: float, wing_width: float):
     credit = safe_mid(short) - safe_mid(long)
     width = abs(float(short["strike"]) - float(long["strike"]))
     max_loss = (width - credit) if np.isfinite(credit) else np.nan
-    return {"name":"Bull Put Spread","legs":[("SELL PUT", float(short["strike"])), ("BUY PUT", float(long["strike"]))],
-            "credit":credit,"width":width,"max_loss":max_loss}
+    return {"name": "Bull Put Spread", "legs": [("SELL PUT", float(short["strike"])), ("BUY PUT", float(long["strike"]))],
+            "credit": credit, "width": width, "max_loss": max_loss}
 
 def build_bear_call(calls_e, target_delta: float, wing_width: float):
     short = pick_short_by_delta(calls_e, target_delta, want_call=True)
@@ -283,8 +343,8 @@ def build_bear_call(calls_e, target_delta: float, wing_width: float):
     credit = safe_mid(short) - safe_mid(long)
     width = abs(float(long["strike"]) - float(short["strike"]))
     max_loss = (width - credit) if np.isfinite(credit) else np.nan
-    return {"name":"Bear Call Spread","legs":[("SELL CALL", float(short["strike"])), ("BUY CALL", float(long["strike"]))],
-            "credit":credit,"width":width,"max_loss":max_loss}
+    return {"name": "Bear Call Spread", "legs": [("SELL CALL", float(short["strike"])), ("BUY CALL", float(long["strike"]))],
+            "credit": credit, "width": width, "max_loss": max_loss}
 
 def build_iron_condor(puts_e, calls_e, target_delta: float, wing_width: float):
     sp = pick_short_by_delta(puts_e, target_delta, want_call=False)
@@ -308,10 +368,15 @@ def build_iron_condor(puts_e, calls_e, target_delta: float, wing_width: float):
     max_w = max(put_w, call_w)
     max_loss = (max_w - total_credit) if np.isfinite(total_credit) else np.nan
 
-    return {"name":"Iron Condor",
-            "legs":[("SELL PUT", spk), ("BUY PUT", lpk), ("SELL CALL", sck), ("BUY CALL", lck)],
-            "credit":total_credit,"width":max_w,"max_loss":max_loss,
-            "put_credit":put_credit,"call_credit":call_credit}
+    return {
+        "name": "Iron Condor",
+        "legs": [("SELL PUT", spk), ("BUY PUT", lpk), ("SELL CALL", sck), ("BUY CALL", lck)],
+        "credit": total_credit,
+        "width": max_w,
+        "max_loss": max_loss,
+        "put_credit": put_credit,
+        "call_credit": call_credit,
+    }
 
 def build_strategy_for_bias(mode: str, auto_bias: str, puts_e, calls_e, target_delta: float, wing_width: float):
     if mode == "Auto":
@@ -394,6 +459,8 @@ for tf_name in ["15m", "4h", "1D"]:
     df = frames.get(tf_name)
     if df is None or df.empty:
         trend_matrix[tf_name] = {"direction": "insufficient", "strength": 0, "regime": "", "notes": "No data"}
+        with st.expander(f"{tf_name} — insufficient (no data)", expanded=True):
+            st.write(trend_matrix[tf_name])
         continue
 
     df_feat = compute_features(df)
@@ -407,8 +474,9 @@ for tf_name in ["15m", "4h", "1D"]:
     ):
         if show_charts:
             import matplotlib.pyplot as plt
+
             dfp = df_feat.tail(260).copy()
-            fig = plt.figure(figsize=(10, 3.5))
+            fig = plt.figure(figsize=(10, 3.6))
             plt.plot(dfp.index, dfp["close"], label="Close")
             for col in ["SMA20", "SMA50", "SMA200"]:
                 if col in dfp.columns and dfp[col].notna().any():
@@ -418,20 +486,22 @@ for tf_name in ["15m", "4h", "1D"]:
             plt.legend()
             plt.tight_layout()
             st.pyplot(fig, clear_figure=True)
+
         st.write(summ)
 
 auto_bias = decide_bias(trend_matrix)
 st.info(f"Auto bias (weighted): **{auto_bias.upper()}**")
 
 # =========================
-# Options: Daily + Weekly ideas
+# OPTIONS: Daily + Weekly ideas (Yahoo direct)
 # =========================
 st.subheader("Options chain → spread ideas (Daily + Weekly)")
 
-tkr = yf.Ticker(symbol)
-
+# spot
 spot = np.nan
 try:
+    # yfinance spot (works fine even when options is blocked)
+    tkr = yf.Ticker(symbol)
     spot = float(getattr(tkr, "fast_info", {}).get("last_price", np.nan))
 except Exception:
     pass
@@ -444,41 +514,42 @@ if not np.isfinite(spot):
 
 st.write(f"Spot: **{spot:.2f}**")
 
-exps = list_expirations(tkr)
-if not exps:
-    st.error("No options expirations found (or Yahoo options unavailable).")
+# expirations (direct Yahoo)
+exps_ts = yahoo_expirations_with_ts(symbol)
+if not exps_ts:
+    st.error("No options expirations available right now (Yahoo may be rate-limiting). Try again in ~60 seconds.")
     st.stop()
 
-def build_idea_block(title: str, dte_min: int, dte_max: int):
-    st.markdown(f"<div class='card'><b>{title}</b><div class='small-muted'>DTE window: {dte_min}–{dte_max}</div>", unsafe_allow_html=True)
+def render_spread_idea(title: str, dte_min: int, dte_max: int):
+    st.markdown(
+        f"<div class='card'><b>{title}</b><div class='small-muted'>DTE window: {dte_min}–{dte_max}</div>",
+        unsafe_allow_html=True,
+    )
 
-    expiry = pick_expiration_in_window(exps, dte_min, dte_max)
-    if not expiry:
+    picked = pick_expiration_in_window_ts(exps_ts, dte_min, dte_max)
+    if not picked:
         st.write("No expiration found in this DTE window for this symbol.")
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
+    expiry, expiry_ts = picked
     ed = datetime.strptime(expiry, "%Y-%m-%d").date()
-    dte = (ed - date.today()).days
-    st.write(f"Chosen expiry: **{expiry}** (DTE={dte})")
+    st.write(f"Chosen expiry: **{expiry}** (DTE={(ed - date.today()).days})")
 
-    try:
-        chain = tkr.option_chain(expiry)
-    except YFRateLimitError:
-        st.write("Yahoo rate-limited the options chain. Try again in ~30–60 seconds.")
-        st.markdown("</div>", unsafe_allow_html=True)
-        return
-    except Exception as e:
-        st.write(f"Options chain error: {e}")
+    chain = yahoo_option_chain(symbol, expiry_ts)
+    if not chain:
+        st.write("Options chain unavailable for this expiry (Yahoo may be throttling). Try again soon.")
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    calls_e = enrich_chain_with_delta(chain.calls, S=spot, expiry=expiry, r=float(r_rate), is_call=True)
-    puts_e  = enrich_chain_with_delta(chain.puts,  S=spot, expiry=expiry, r=float(r_rate), is_call=False)
+    calls_raw, puts_raw = chain
+
+    calls_e = enrich_chain_with_delta(calls_raw, S=spot, expiry=expiry, r=float(r_rate), is_call=True)
+    puts_e = enrich_chain_with_delta(puts_raw, S=spot, expiry=expiry, r=float(r_rate), is_call=False)
 
     strat = build_strategy_for_bias(mode, auto_bias, puts_e, calls_e, float(target_delta), float(wing_width))
     if not strat:
-        st.write("Could not construct a spread (missing IV/mids/strikes). Try a different delta or wing width.")
+        st.write("Could not construct a spread (missing IV/mids/strikes). Try another delta or wing width.")
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
@@ -505,8 +576,8 @@ def build_idea_block(title: str, dte_min: int, dte_max: int):
 
 colA, colB = st.columns(2)
 with colA:
-    build_idea_block("📅 Daily Spread Idea", 0, 2)
+    render_spread_idea("📅 Daily Spread Idea", 0, 2)
 with colB:
-    build_idea_block("🗓️ Weekly Spread Idea", 5, 12)
+    render_spread_idea("🗓️ Weekly Spread Idea", 5, 12)
 
 st.caption("Educational only — not investment advice.")
