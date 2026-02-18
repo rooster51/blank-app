@@ -1,34 +1,32 @@
+import os
 import math
-import time
-import random
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-import yfinance as yf
-from yfinance.exceptions import YFRateLimitError
-from scipy.stats import norm
 import requests
+from scipy.stats import norm
 
 # =========================
 # App config
 # =========================
 st.set_page_config(page_title="Trend + Credit Spreads", layout="wide")
-
 TZ = "America/New_York"
+
 DEFAULT_WATCHLIST = ["NVDA", "AAPL", "MSFT", "SPY", "QQQ", "TSLA", "AMD", "META", "AMZN", "GOOGL"]
 
+MD_BASE = "https://api.marketdata.app/v1"
+
 # =========================
-# Styling (dark-friendly, minimal)
+# Styling (dark-friendly)
 # =========================
 st.markdown(
     """
 <style>
-.block-container { max-width: 1180px; padding-top: 1.0rem; padding-bottom: 2.5rem; }
-.small-muted { opacity: 0.80; font-size: 0.92rem; }
+.block-container { max-width: 1180px; padding-top: 1.0rem; padding-bottom: 2.2rem; }
 .card { border: 1px solid rgba(255,255,255,0.12); border-radius: 14px; padding: 14px; background: rgba(255,255,255,0.03); }
-hr { border: none; border-top: 1px solid rgba(255,255,255,0.12); margin: 0.75rem 0; }
+.small-muted { opacity: 0.80; font-size: 0.92rem; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -38,7 +36,37 @@ st.title("📈 Trend Scanner → Credit Spread Builder")
 st.caption("Educational only. Options trading involves substantial risk (assignment, gap risk, liquidity).")
 
 # =========================
-# Trend indicators
+# Token handling
+# =========================
+def get_marketdata_token() -> str:
+    try:
+        tok = str(st.secrets.get("MARKETDATA_TOKEN", "")).strip()
+    except Exception:
+        tok = ""
+    if tok:
+        return tok
+    return os.environ.get("MARKETDATA_TOKEN", "").strip()
+
+def md_headers() -> dict:
+    tok = get_marketdata_token()
+    h = {"Accept": "application/json"}
+    if tok:
+        h["Authorization"] = f"Bearer {tok}"
+    return h
+
+def md_get_json(url: str, params: dict | None = None) -> dict | None:
+    try:
+        r = requests.get(url, headers=md_headers(), params=params, timeout=12)
+        if r.status_code in (401, 403):
+            return {"s": "error", "errmsg": "Auth failed. Check MARKETDATA_TOKEN in Streamlit Secrets."}
+        if r.status_code >= 400:
+            return {"s": "error", "errmsg": f"HTTP {r.status_code}: {r.text[:180]}"}
+        return r.json()
+    except Exception as e:
+        return {"s": "error", "errmsg": f"Request error: {e}"}
+
+# =========================
+# Indicators / Trend
 # =========================
 def sma(s: pd.Series, n: int) -> pd.Series:
     return s.rolling(n).mean()
@@ -59,28 +87,25 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 def classify_trend_adaptive(df: pd.DataFrame) -> dict:
-    """
-    Adaptive trend:
-    - Uses SMA200 if available; otherwise falls back to SMA20/50.
-    Prevents 4H from failing due to missing 200+ bars.
-    """
+    # Allows trend reading even if SMA200 not present
     if df is None or df.empty or len(df) < 60:
         return {"direction": "insufficient", "strength": 0, "regime": "", "notes": "Need ~60+ bars"}
 
     last = df.iloc[-1]
     close = float(last["close"])
     r = float(last["RSI14"]) if pd.notna(last["RSI14"]) else 50.0
+
     s20 = last.get("SMA20", np.nan)
     s50 = last.get("SMA50", np.nan)
     s200 = last.get("SMA200", np.nan)
 
-    has_50 = pd.notna(s50)
+    has_50 = pd.notna(s20) and pd.notna(s50)
     has_200 = pd.notna(s200)
 
     direction = "neutral"
     strength = 45
 
-    if has_50 and pd.notna(s20):
+    if has_50:
         if has_200:
             if s20 > s50 > s200 and close > s20:
                 direction, strength = "bullish", 80
@@ -93,7 +118,6 @@ def classify_trend_adaptive(df: pd.DataFrame) -> dict:
             else:
                 direction, strength = "neutral", 45
         else:
-            # Shorter-term logic
             if s20 > s50 and close > s20:
                 direction, strength = "bullish", 65
             elif s20 > s50:
@@ -117,7 +141,6 @@ def classify_trend_adaptive(df: pd.DataFrame) -> dict:
     return {"direction": direction, "strength": strength, "regime": regime, "notes": notes}
 
 def decide_bias(trend_matrix: dict) -> str:
-    # weights: 1D strongest, 4h medium, 15m light
     score = 0
     for tf, w in [("1D", 3), ("4h", 2), ("15m", 1)]:
         d = trend_matrix.get(tf, {}).get("direction", "insufficient")
@@ -132,29 +155,43 @@ def decide_bias(trend_matrix: dict) -> str:
     return "neutral"
 
 # =========================
-# Candles (yfinance + backoff)
+# MarketData Candles
 # =========================
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_yf(symbol: str, interval: str, period: str) -> pd.DataFrame | None:
-    tkr = yf.Ticker(symbol)
-    for attempt in range(5):
-        try:
-            hist = tkr.history(period=period, interval=interval, auto_adjust=False)
-            if hist is None or hist.empty:
-                return None
-            df = hist.rename(
-                columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
-            )[["open", "high", "low", "close", "volume"]].copy()
-            if df.index.tz is None:
-                df.index = df.index.tz_localize("UTC")
-            df.index = df.index.tz_convert(TZ)
-            df.index.name = "time"
-            return df
-        except YFRateLimitError:
-            time.sleep((2 ** attempt) + random.uniform(0, 0.7))
-        except Exception:
-            return None
-    return None
+def md_candles(symbol: str, interval: str, lookback_days: int) -> pd.DataFrame | None:
+    """
+    Uses MarketData candles endpoint.
+    NOTE: Endpoint/path/params may vary slightly by plan. If your plan returns different keys,
+    we normalize for common 't/o/h/l/c/v' style arrays.
+    """
+    end = datetime.now(timezone.utc)
+    start = end - pd.Timedelta(days=lookback_days)
+    params = {
+        "interval": interval,                       # e.g. "15m", "1d"
+        "from": int(start.timestamp()),
+        "to": int(end.timestamp()),
+    }
+    j = md_get_json(f"{MD_BASE}/stocks/candles/{symbol}/", params=params)
+    if not isinstance(j, dict) or j.get("s") != "ok":
+        return None
+
+    # Common response patterns: arrays for t/o/h/l/c/v
+    # We handle a few key variants defensively.
+    t = j.get("t") or j.get("time") or j.get("timestamp")
+    o = j.get("o") or j.get("open")
+    h = j.get("h") or j.get("high")
+    l = j.get("l") or j.get("low")
+    c = j.get("c") or j.get("close")
+    v = j.get("v") or j.get("volume")
+
+    if not (isinstance(t, list) and isinstance(c, list)) or len(t) == 0:
+        return None
+
+    df = pd.DataFrame({"open": o, "high": h, "low": l, "close": c, "volume": v})
+    idx = pd.to_datetime(pd.Series(t), unit="s", utc=True).dt.tz_convert(TZ)
+    df.index = idx
+    df.index.name = "time"
+    return df.dropna()
 
 def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     out = pd.DataFrame(
@@ -170,83 +207,60 @@ def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     return out
 
 def fetch_timeframes(symbol: str):
-    df_15m = fetch_yf(symbol, "15m", "60d")
+    # 15m: ~60 days
+    df_15m = md_candles(symbol, interval="15m", lookback_days=60)
+    # 4h: resample from 15m (stable + consistent)
     df_4h = resample_ohlcv(df_15m, "4H") if df_15m is not None and not df_15m.empty else None
-    df_1d = fetch_yf(symbol, "1d", "3y")
+    # 1D: ~3y
+    df_1d = md_candles(symbol, interval="1d", lookback_days=365 * 3)
     return {"15m": df_15m, "4h": df_4h, "1D": df_1d}
 
 # =========================
-# Yahoo Options (DIRECT) — fixes Streamlit Cloud empty expirations
+# MarketData Options
 # =========================
-YAHOO_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 "
-                  "(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-    "Accept": "application/json,text/plain,*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
 @st.cache_data(ttl=600, show_spinner=False)
-def yahoo_get_options_json(symbol: str, date_ts: int | None = None) -> dict | None:
-    base = f"https://query2.finance.yahoo.com/v7/finance/options/{symbol}"
-    url = base if date_ts is None else f"{base}?date={int(date_ts)}"
-    for attempt in range(6):
-        try:
-            r = requests.get(url, headers=YAHOO_HEADERS, timeout=12)
-            if r.status_code == 429:
-                time.sleep((2 ** attempt) + random.uniform(0, 0.9))
-                continue
-            if r.status_code >= 400:
-                return None
-            return r.json()
-        except Exception:
-            time.sleep(0.6 + random.uniform(0, 0.5))
+def md_stock_quote(symbol: str) -> float | None:
+    j = md_get_json(f"{MD_BASE}/stocks/quotes/{symbol}/")
+    if not isinstance(j, dict) or j.get("s") != "ok":
+        return None
+    for key in ("last", "mid", "Last", "Mid"):
+        v = j.get(key, None)
+        if isinstance(v, list) and v:
+            try:
+                return float(v[-1])
+            except Exception:
+                pass
+        if isinstance(v, (int, float)):
+            return float(v)
     return None
 
-def yahoo_expirations_with_ts(symbol: str) -> list[tuple[str, int]]:
-    j = yahoo_get_options_json(symbol, None)
-    try:
-        ts_list = j["optionChain"]["result"][0]["expirationDates"]
-        out = []
-        for ts in ts_list:
-            ds = datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d")
-            out.append((ds, int(ts)))
-        return out
-    except Exception:
-        return []
+@st.cache_data(ttl=1800, show_spinner=False)
+def md_options_expirations(symbol: str) -> list[str] | None:
+    j = md_get_json(f"{MD_BASE}/options/expirations/{symbol}/")
+    if not isinstance(j, dict) or j.get("s") != "ok":
+        return None
+    exps = j.get("expirations", [])
+    return [str(x) for x in exps] if isinstance(exps, list) else None
 
-def pick_expiration_in_window_ts(exps: list[tuple[str, int]], dte_min: int, dte_max: int) -> tuple[str, int] | None:
-    if not exps:
+@st.cache_data(ttl=600, show_spinner=False)
+def md_option_chain(symbol: str, expiration: str, side: str) -> pd.DataFrame | None:
+    params = {"expiration": expiration, "side": side}  # side: "call" or "put"
+    j = md_get_json(f"{MD_BASE}/options/chain/{symbol}/", params=params)
+    if not isinstance(j, dict) or j.get("s") != "ok":
         return None
-    today = date.today()
-    candidates = []
-    for ds, ts in exps:
-        try:
-            ed = datetime.strptime(ds, "%Y-%m-%d").date()
-            dte = (ed - today).days
-            if dte_min <= dte <= dte_max:
-                candidates.append((dte, ds, ts))
-        except Exception:
-            pass
-    if not candidates:
+    cols = {k: v for k, v in j.items() if isinstance(v, list)}
+    if not cols:
         return None
-    target = int(round((dte_min + dte_max) / 2))
-    candidates.sort(key=lambda x: abs(x[0] - target))
-    return (candidates[0][1], candidates[0][2])
-
-def yahoo_option_chain(symbol: str, expiry_ts: int) -> tuple[pd.DataFrame, pd.DataFrame] | None:
-    j = yahoo_get_options_json(symbol, expiry_ts)
-    try:
-        opt = j["optionChain"]["result"][0]["options"][0]
-        calls = pd.DataFrame(opt.get("calls", []))
-        puts = pd.DataFrame(opt.get("puts", []))
-        if calls.empty and puts.empty:
-            return None
-        return calls, puts
-    except Exception:
-        return None
+    df = pd.DataFrame(cols)
+    for c in ("strike", "bid", "ask", "mid", "iv", "delta"):
+        if c not in df.columns:
+            df[c] = np.nan
+    for c in ("strike", "bid", "ask", "mid", "iv", "delta"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
 
 # =========================
-# Options + spreads
+# Spread logic
 # =========================
 def bs_delta(S, K, T, r, sigma, is_call: bool):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
@@ -254,37 +268,28 @@ def bs_delta(S, K, T, r, sigma, is_call: bool):
     d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
     return norm.cdf(d1) if is_call else (norm.cdf(d1) - 1.0)
 
-def enrich_chain_with_delta(chain_df: pd.DataFrame, S: float, expiry: str, r: float, is_call: bool):
+def ensure_delta(df: pd.DataFrame, spot: float, expiry: str, r: float, is_call: bool) -> pd.DataFrame:
+    out = df.copy()
     ed = datetime.strptime(expiry, "%Y-%m-%d").date()
     T = max((ed - date.today()).days / 365.0, 1e-6)
 
-    df = chain_df.copy()
+    if "delta" in out.columns and out["delta"].notna().any():
+        out["delta_est"] = out["delta"]
+    else:
+        out["delta_est"] = [
+            bs_delta(spot, float(k), T, r, float(iv), is_call)
+            if np.isfinite(k) and np.isfinite(iv)
+            else np.nan
+            for k, iv in zip(out["strike"].values, out["iv"].values)
+        ]
 
-    # Normalize likely Yahoo field names to expected ones
-    # Yahoo returns bid/ask/strike/impliedVolatility already; keep safe.
-    if "impliedVolatility" not in df.columns:
-        df["impliedVolatility"] = np.nan
-    if "bid" not in df.columns:
-        df["bid"] = np.nan
-    if "ask" not in df.columns:
-        df["ask"] = np.nan
-    if "strike" not in df.columns:
-        df["strike"] = np.nan
-
-    bid = df["bid"]
-    ask = df["ask"]
-    df["mid"] = np.where(np.isfinite(bid) & np.isfinite(ask) & (ask > 0), (bid + ask) / 2.0, np.nan)
-
-    deltas = []
-    for _, row in df.iterrows():
-        K = float(row.get("strike", np.nan))
-        iv = float(row.get("impliedVolatility", np.nan))
-        if not np.isfinite(K) or not np.isfinite(iv):
-            deltas.append(np.nan)
-        else:
-            deltas.append(bs_delta(S, K, T, r, iv, is_call))
-    df["delta_est"] = deltas
-    return df
+    if "mid" not in out.columns or not out["mid"].notna().any():
+        out["mid"] = np.where(
+            np.isfinite(out["bid"]) & np.isfinite(out["ask"]) & (out["ask"] > 0),
+            (out["bid"] + out["ask"]) / 2.0,
+            np.nan,
+        )
+    return out
 
 def pick_short_by_delta(df: pd.DataFrame, target_delta: float, want_call: bool):
     d_target = target_delta if want_call else -target_delta
@@ -299,7 +304,6 @@ def pick_wing_by_width(df: pd.DataFrame, short_strike: float, wing_width: float,
     strikes = np.array(sorted(x["strike"].unique()))
     if len(strikes) < 2:
         return None
-
     if want_call:
         target = short_strike + wing_width
         cand = strikes[strikes > short_strike]
@@ -312,7 +316,6 @@ def pick_wing_by_width(df: pd.DataFrame, short_strike: float, wing_width: float,
         if len(cand) == 0:
             return None
         chosen = cand[np.argmin(np.abs(cand - target))]
-
     row = x[x["strike"] == chosen]
     return row.iloc[0] if not row.empty else None
 
@@ -330,7 +333,8 @@ def build_bull_put(puts_e, target_delta: float, wing_width: float):
     credit = safe_mid(short) - safe_mid(long)
     width = abs(float(short["strike"]) - float(long["strike"]))
     max_loss = (width - credit) if np.isfinite(credit) else np.nan
-    return {"name": "Bull Put Spread", "legs": [("SELL PUT", float(short["strike"])), ("BUY PUT", float(long["strike"]))],
+    return {"name": "Bull Put Spread",
+            "legs": [("SELL PUT", float(short["strike"])), ("BUY PUT", float(long["strike"]))],
             "credit": credit, "width": width, "max_loss": max_loss}
 
 def build_bear_call(calls_e, target_delta: float, wing_width: float):
@@ -343,7 +347,8 @@ def build_bear_call(calls_e, target_delta: float, wing_width: float):
     credit = safe_mid(short) - safe_mid(long)
     width = abs(float(long["strike"]) - float(short["strike"]))
     max_loss = (width - credit) if np.isfinite(credit) else np.nan
-    return {"name": "Bear Call Spread", "legs": [("SELL CALL", float(short["strike"])), ("BUY CALL", float(long["strike"]))],
+    return {"name": "Bear Call Spread",
+            "legs": [("SELL CALL", float(short["strike"])), ("BUY CALL", float(long["strike"]))],
             "credit": credit, "width": width, "max_loss": max_loss}
 
 def build_iron_condor(puts_e, calls_e, target_delta: float, wing_width: float):
@@ -368,17 +373,12 @@ def build_iron_condor(puts_e, calls_e, target_delta: float, wing_width: float):
     max_w = max(put_w, call_w)
     max_loss = (max_w - total_credit) if np.isfinite(total_credit) else np.nan
 
-    return {
-        "name": "Iron Condor",
-        "legs": [("SELL PUT", spk), ("BUY PUT", lpk), ("SELL CALL", sck), ("BUY CALL", lck)],
-        "credit": total_credit,
-        "width": max_w,
-        "max_loss": max_loss,
-        "put_credit": put_credit,
-        "call_credit": call_credit,
-    }
+    return {"name": "Iron Condor",
+            "legs": [("SELL PUT", spk), ("BUY PUT", lpk), ("SELL CALL", sck), ("BUY CALL", lck)],
+            "credit": total_credit, "width": max_w, "max_loss": max_loss,
+            "put_credit": put_credit, "call_credit": call_credit}
 
-def build_strategy_for_bias(mode: str, auto_bias: str, puts_e, calls_e, target_delta: float, wing_width: float):
+def build_strategy(mode: str, auto_bias: str, puts_e, calls_e, target_delta: float, wing_width: float):
     if mode == "Auto":
         bias = auto_bias
     elif mode == "Bull Put":
@@ -396,56 +396,79 @@ def build_strategy_for_bias(mode: str, auto_bias: str, puts_e, calls_e, target_d
         return build_bear_call(calls_e, target_delta, wing_width)
     return None
 
+def pick_expiration_in_dte_window(expirations: list[str], dte_min: int, dte_max: int) -> str | None:
+    today = date.today()
+    candidates = []
+    for e in expirations:
+        try:
+            ed = datetime.strptime(e, "%Y-%m-%d").date()
+            dte = (ed - today).days
+            if dte_min <= dte <= dte_max:
+                candidates.append((dte, e))
+        except Exception:
+            pass
+    if not candidates:
+        return None
+    target = int(round((dte_min + dte_max) / 2))
+    candidates.sort(key=lambda x: abs(x[0] - target))
+    return candidates[0][1]
+
 # =========================
-# Watchlist state
+# UI state
 # =========================
 if "watchlist" not in st.session_state:
     st.session_state.watchlist = DEFAULT_WATCHLIST.copy()
 
+if not get_marketdata_token():
+    st.warning("Add MARKETDATA_TOKEN in Streamlit Secrets to enable MarketData candles + options.")
+
 # =========================
-# MAIN CONTROLS (NO SIDEBAR)
+# Controls (form)
 # =========================
 st.markdown("<div class='card'>", unsafe_allow_html=True)
 
-row1 = st.columns([2.2, 1.4, 1.2, 1.2])
+with st.form("controls", clear_on_submit=False):
+    c1, c2, c3, c4 = st.columns([2.2, 1.5, 1.3, 1.2])
 
-with row1[0]:
-    symbol = st.selectbox("Ticker", st.session_state.watchlist, index=0)
-    add_row = st.columns([1.6, 0.8, 0.8])
-    with add_row[0]:
+    with c1:
+        symbol = st.selectbox("Ticker", st.session_state.watchlist, index=0)
         new_sym = st.text_input("Add ticker", placeholder="NFLX").strip().upper()
-    with add_row[1]:
-        if st.button("Add"):
-            if new_sym and new_sym not in st.session_state.watchlist:
-                st.session_state.watchlist.append(new_sym)
-                st.success(f"Added {new_sym}")
-                st.rerun()
-    with add_row[2]:
-        if st.button("Remove"):
-            if len(st.session_state.watchlist) > 1 and symbol in st.session_state.watchlist:
-                st.session_state.watchlist.remove(symbol)
-                st.rerun()
+        bA, bB = st.columns(2)
+        with bA:
+            add_clicked = st.form_submit_button("Add")
+        with bB:
+            remove_clicked = st.form_submit_button("Remove")
 
-with row1[1]:
-    mode = st.selectbox("Strategy mode", ["Auto", "Bull Put", "Bear Call", "Iron Condor"])
-    target_delta = st.slider("Target delta", 0.10, 0.35, 0.20, 0.01)
+    with c2:
+        mode = st.selectbox("Strategy mode", ["Auto", "Bull Put", "Bear Call", "Iron Condor"])
+        target_delta = st.slider("Target delta", 0.10, 0.35, 0.20, 0.01)
 
-with row1[2]:
-    wing_width = st.slider("Wing width ($)", 1.00, 2.50, 1.50, 0.05)
-    r_rate = st.number_input("Risk-free r", 0.0, 0.20, 0.04, 0.005)
+    with c3:
+        wing_width = st.slider("Wing width ($)", 1.00, 2.50, 1.50, 0.05)
+        r_rate = st.number_input("Risk-free r", 0.0, 0.20, 0.04, 0.005)
 
-with row1[3]:
-    show_charts = st.checkbox("Show charts", value=True)
-    run = st.button("🚀 Run", type="primary", use_container_width=True)
+    with c4:
+        show_charts = st.checkbox("Show charts", value=True)
+        skip_options = st.checkbox("Skip options", value=False)
+        run = st.form_submit_button("🚀 Run", use_container_width=True)
+
+if add_clicked:
+    if new_sym and new_sym not in st.session_state.watchlist:
+        st.session_state.watchlist.append(new_sym)
+        st.rerun()
+
+if remove_clicked:
+    if len(st.session_state.watchlist) > 1 and symbol in st.session_state.watchlist:
+        st.session_state.watchlist.remove(symbol)
+        st.rerun()
 
 st.markdown("</div>", unsafe_allow_html=True)
 
 if not run:
-    st.write("Tap **Run** to scan trends and generate Daily/Weekly spread ideas.")
     st.stop()
 
 # =========================
-# DATA + TREND SCAN
+# Trend scan (MarketData candles)
 # =========================
 with st.spinner("Fetching candles…"):
     frames = fetch_timeframes(symbol)
@@ -474,50 +497,43 @@ for tf_name in ["15m", "4h", "1D"]:
     ):
         if show_charts:
             import matplotlib.pyplot as plt
-
             dfp = df_feat.tail(260).copy()
             fig = plt.figure(figsize=(10, 3.6))
             plt.plot(dfp.index, dfp["close"], label="Close")
             for col in ["SMA20", "SMA50", "SMA200"]:
-                if col in dfp.columns and dfp[col].notna().any():
+                if dfp[col].notna().any():
                     plt.plot(dfp.index, dfp[col], label=col)
             plt.title(f"{symbol} {tf_name}")
             plt.grid(True)
             plt.legend()
             plt.tight_layout()
             st.pyplot(fig, clear_figure=True)
-
         st.write(summ)
 
 auto_bias = decide_bias(trend_matrix)
 st.info(f"Auto bias (weighted): **{auto_bias.upper()}**")
 
 # =========================
-# OPTIONS: Daily + Weekly ideas (Yahoo direct)
+# Options ideas (MarketData)
 # =========================
+if skip_options:
+    st.info("Options skipped (charts only).")
+    st.stop()
+
 st.subheader("Options chain → spread ideas (Daily + Weekly)")
 
-# spot
-spot = np.nan
-try:
-    # yfinance spot (works fine even when options is blocked)
-    tkr = yf.Ticker(symbol)
-    spot = float(getattr(tkr, "fast_info", {}).get("last_price", np.nan))
-except Exception:
-    pass
-if not np.isfinite(spot):
-    spot = float(latest_close) if latest_close is not None else np.nan
-
-if not np.isfinite(spot):
+spot = md_stock_quote(symbol)
+if spot is None and latest_close is not None:
+    spot = float(latest_close)
+if spot is None or not np.isfinite(spot):
     st.error("Spot price unavailable.")
     st.stop()
 
 st.write(f"Spot: **{spot:.2f}**")
 
-# expirations (direct Yahoo)
-exps_ts = yahoo_expirations_with_ts(symbol)
-if not exps_ts:
-    st.error("No options expirations available right now (Yahoo may be rate-limiting). Try again in ~60 seconds.")
+expirations = md_options_expirations(symbol)
+if not expirations:
+    st.error("No expirations returned (token/plan may not include options, or symbol unsupported).")
     st.stop()
 
 def render_spread_idea(title: str, dte_min: int, dte_max: int):
@@ -526,30 +542,28 @@ def render_spread_idea(title: str, dte_min: int, dte_max: int):
         unsafe_allow_html=True,
     )
 
-    picked = pick_expiration_in_window_ts(exps_ts, dte_min, dte_max)
-    if not picked:
-        st.write("No expiration found in this DTE window for this symbol.")
+    expiry = pick_expiration_in_dte_window(expirations, dte_min, dte_max)
+    if not expiry:
+        st.write("No expiration found in this DTE window.")
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    expiry, expiry_ts = picked
     ed = datetime.strptime(expiry, "%Y-%m-%d").date()
     st.write(f"Chosen expiry: **{expiry}** (DTE={(ed - date.today()).days})")
 
-    chain = yahoo_option_chain(symbol, expiry_ts)
-    if not chain:
-        st.write("Options chain unavailable for this expiry (Yahoo may be throttling). Try again soon.")
+    calls = md_option_chain(symbol, expiry, side="call")
+    puts = md_option_chain(symbol, expiry, side="put")
+    if calls is None or puts is None or calls.empty or puts.empty:
+        st.write("Options chain unavailable for this expiry (plan might not include quotes/greeks).")
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    calls_raw, puts_raw = chain
+    calls_e = ensure_delta(calls, spot, expiry, float(r_rate), is_call=True)
+    puts_e = ensure_delta(puts, spot, expiry, float(r_rate), is_call=False)
 
-    calls_e = enrich_chain_with_delta(calls_raw, S=spot, expiry=expiry, r=float(r_rate), is_call=True)
-    puts_e = enrich_chain_with_delta(puts_raw, S=spot, expiry=expiry, r=float(r_rate), is_call=False)
-
-    strat = build_strategy_for_bias(mode, auto_bias, puts_e, calls_e, float(target_delta), float(wing_width))
+    strat = build_strategy(mode, auto_bias, puts_e, calls_e, float(target_delta), float(wing_width))
     if not strat:
-        st.write("Could not construct a spread (missing IV/mids/strikes). Try another delta or wing width.")
+        st.write("Could not construct a spread (missing mids/IV/delta/strikes). Try another delta/wing width.")
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
