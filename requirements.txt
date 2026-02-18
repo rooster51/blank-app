@@ -1,8 +1,7 @@
 streamlit
+yfinance
 pandas
 numpy
-matplotlib
 scipy
-plotly
-yfinance
-finnhub-python
+matplotlib
+requests
