@@ -75,7 +75,7 @@ def md_options_expirations(symbol: str) -> list[str] | None:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def md_option_chain(symbol: str, expiration: str, side: str) -> pd.DataFrame | None:
-    params = {"expiration": expiration, "side": side}  # "call" | "put"
+    params = {"expiration": expiration, "side": side}
     j = md_get_json(f"{MD_BASE}/options/chain/{symbol}/", params=params)
     if not isinstance(j, dict) or j.get("s") != "ok":
         return None
@@ -83,9 +83,9 @@ def md_option_chain(symbol: str, expiration: str, side: str) -> pd.DataFrame | N
     cols = {k: v for k, v in j.items() if isinstance(v, list)}
     if not cols:
         return None
+
     df = pd.DataFrame(cols)
 
-    # normalize contract symbol
     if "optionSymbol" not in df.columns:
         for alt in ("symbol", "contractSymbol", "option_symbol", "option", "id"):
             if alt in df.columns:
@@ -95,16 +95,17 @@ def md_option_chain(symbol: str, expiration: str, side: str) -> pd.DataFrame | N
     for c in ("strike", "bid", "ask", "mid", "iv", "delta"):
         if c not in df.columns:
             df[c] = np.nan
+
     for c in ("strike", "bid", "ask", "mid", "iv", "delta"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # mid from bid/ask if missing
     if not df["mid"].notna().any():
         df["mid"] = np.where(
             np.isfinite(df["bid"]) & np.isfinite(df["ask"]) & (df["ask"] > 0),
             (df["bid"] + df["ask"]) / 2.0,
             np.nan,
         )
+
     return df
 
 @st.cache_data(ttl=90, show_spinner=False)
@@ -115,24 +116,40 @@ def md_option_quote(option_symbol: str) -> dict | None:
 
     def last_val(k, default=np.nan):
         v = j.get(k, default)
-        if isinstance(v, list) and v:
-            return v[-1]
+        if isinstance(v, list):
+            return v[-1] if len(v) > 0 else default
         return v
 
-    bid_v = last_val("bid", np.nan)
-    ask_v = last_val("ask", np.nan)
-    mid_v = last_val("mid", np.nan)
-    iv_v = last_val("iv", np.nan)
-    delta_v = last_val("delta", np.nan)
-    last_v = last_val("last", np.nan)
+    def to_float(v):
+        try:
+            if v is None:
+                return np.nan
+            if isinstance(v, str):
+                v = v.strip()
+                if v == "" or v.lower() in {"none", "nan", "null"}:
+                    return np.nan
+            return float(v)
+        except Exception:
+            return np.nan
 
-    bid = float(bid_v) if np.isfinite(bid_v) else np.nan
-    ask = float(ask_v) if np.isfinite(ask_v) else np.nan
-    mid = float(mid_v) if np.isfinite(mid_v) else ((bid + ask) / 2.0 if np.isfinite(bid) and np.isfinite(ask) else np.nan)
-    iv = float(iv_v) if np.isfinite(iv_v) else np.nan
-    delta = float(delta_v) if np.isfinite(delta_v) else np.nan
-    last = float(last_v) if np.isfinite(last_v) else np.nan
-    return {"bid": bid, "ask": ask, "mid": mid, "iv": iv, "delta": delta, "last": last}
+    bid = to_float(last_val("bid"))
+    ask = to_float(last_val("ask"))
+    mid = to_float(last_val("mid"))
+    iv = to_float(last_val("iv"))
+    delta = to_float(last_val("delta"))
+    last = to_float(last_val("last"))
+
+    if not np.isfinite(mid) and np.isfinite(bid) and np.isfinite(ask):
+        mid = (bid + ask) / 2.0
+
+    return {
+        "bid": bid,
+        "ask": ask,
+        "mid": mid,
+        "iv": iv,
+        "delta": delta,
+        "last": last,
+    }
 
 # =========================================================
 # Candles: yfinance (charts)
@@ -265,8 +282,35 @@ def decide_bias(trend_matrix: dict) -> str:
     return "neutral"
 
 # =========================================================
-# Recommendation engine (trend + greeks)
+# Recommendation engine
 # =========================================================
+def auto_params_from_trend(auto_bias: str, strength: int, regime: str):
+    if regime == "range":
+        delta = 0.15
+    elif strength >= 80:
+        delta = 0.25
+    elif strength >= 60:
+        delta = 0.20
+    else:
+        delta = 0.18
+
+    if regime == "range":
+        dte = (30, 45)
+    else:
+        dte = (7, 21)
+
+    if auto_bias == "bullish":
+        single = {"side": "call", "action": "BUY"}
+        spread = "Bull Put"
+    elif auto_bias == "bearish":
+        single = {"side": "put", "action": "BUY"}
+        spread = "Bear Call"
+    else:
+        single = {"side": "call", "action": "SELL"}
+        spread = "Iron Condor"
+
+    return {"target_delta": delta, "dte_min": dte[0], "dte_max": dte[1], "single_pref": single, "spread_pref": spread}
+
 def pick_expiration_in_dte_window(expirations: list[str], dte_min: int, dte_max: int) -> str | None:
     today = date.today()
     candidates = []
@@ -284,111 +328,68 @@ def pick_expiration_in_dte_window(expirations: list[str], dte_min: int, dte_max:
     candidates.sort(key=lambda x: abs(x[0] - target))
     return candidates[0][1]
 
-def auto_params_from_trend(auto_bias: str, strength: int, regime: str):
-    """
-    Converts trend into recommended DTE + delta.
-    """
-    # Delta: stronger trends = a bit higher delta (closer), ranges = lower delta (farther)
-    if regime == "range":
-        delta = 0.15
-    elif strength >= 80:
-        delta = 0.25
-    elif strength >= 60:
-        delta = 0.20
-    else:
-        delta = 0.18
-
-    # DTE: range likes more time; short-term trend can be tighter
-    if regime == "range":
-        dte = (30, 45)
-    else:
-        dte = (7, 21)
-
-    # Single-leg preference
-    # bullish -> BUY CALL (or SELL PUT); bearish -> BUY PUT (or SELL CALL); neutral -> SELL premium / condor
-    if auto_bias == "bullish":
-        single = {"side": "call", "action": "BUY"}
-        spread = "Bull Put"
-    elif auto_bias == "bearish":
-        single = {"side": "put", "action": "BUY"}
-        spread = "Bear Call"
-    else:
-        single = {"side": "call", "action": "SELL"}  # default sell call as placeholder; user can switch
-        spread = "Iron Condor"
-
-    return {"target_delta": delta, "dte_min": dte[0], "dte_max": dte[1], "single_pref": single, "spread_pref": spread}
-
 def select_candidate_symbols(chain: pd.DataFrame, spot: float, side: str, max_candidates: int = 18) -> pd.DataFrame:
-    """
-    Cut down the chain to a small set near-the-money/OTM to avoid tons of quote calls.
-    """
     df = chain.dropna(subset=["strike", "optionSymbol"]).copy()
     df = df[np.isfinite(df["strike"])]
     if df.empty:
         return df
 
     if side == "call":
-        # prefer OTM calls
         df["otm_dist"] = (df["strike"] - spot).clip(lower=0)
         df = df.sort_values(["otm_dist", "strike"]).head(max_candidates)
     else:
-        # prefer OTM puts
         df["otm_dist"] = (spot - df["strike"]).clip(lower=0)
         df = df.sort_values(["otm_dist", "strike"], ascending=[False, False]).head(max_candidates)
 
     return df
 
 def attach_quotes(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    For each optionSymbol, fetch quote (bid/ask/mid/iv/delta).
-    This is where entitlement matters.
-    """
     out = df.copy()
     bids, asks, mids, ivs, deltas = [], [], [], [], []
+
     for sym in out["optionSymbol"].astype(str).tolist():
         q = md_option_quote(sym)
         if not q:
-            bids.append(np.nan); asks.append(np.nan); mids.append(np.nan); ivs.append(np.nan); deltas.append(np.nan)
+            bids.append(np.nan)
+            asks.append(np.nan)
+            mids.append(np.nan)
+            ivs.append(np.nan)
+            deltas.append(np.nan)
         else:
-            bids.append(q["bid"]); asks.append(q["ask"]); mids.append(q["mid"]); ivs.append(q["iv"]); deltas.append(q["delta"])
-    out["q_bid"] = bids
-    out["q_ask"] = asks
-    out["q_mid"] = mids
-    out["q_iv"] = ivs
-    out["q_delta"] = deltas
+            bids.append(q.get("bid", np.nan))
+            asks.append(q.get("ask", np.nan))
+            mids.append(q.get("mid", np.nan))
+            ivs.append(q.get("iv", np.nan))
+            deltas.append(q.get("delta", np.nan))
+
+    out["q_bid"] = pd.to_numeric(bids, errors="coerce")
+    out["q_ask"] = pd.to_numeric(asks, errors="coerce")
+    out["q_mid"] = pd.to_numeric(mids, errors="coerce")
+    out["q_iv"] = pd.to_numeric(ivs, errors="coerce")
+    out["q_delta"] = pd.to_numeric(deltas, errors="coerce")
     return out
 
 def recommend_single_leg(chain: pd.DataFrame, spot: float, side: str, action: str, target_delta: float) -> pd.DataFrame:
-    """
-    Return top single-leg recommendations ranked by delta closeness, then mid.
-    Works best when quotes return delta.
-    Fallback: use percent OTM when delta missing.
-    """
     base = select_candidate_symbols(chain, spot, side, max_candidates=18)
     if base.empty:
         return base
 
     q = attach_quotes(base)
-    q = q.dropna(subset=["q_mid"], how="all")  # if no mids at all, it'll be empty
-
+    q = q.dropna(subset=["q_mid"], how="all")
     if q.empty:
         return q
 
-    # delta-based ranking if available
     if q["q_delta"].notna().any():
         desired = target_delta if side == "call" else -target_delta
         q["score"] = (q["q_delta"] - desired).abs()
     else:
-        # percent OTM fallback
         if side == "call":
             q["score"] = ((q["strike"] / spot) - 1.0).abs()
         else:
             q["score"] = (1.0 - (q["strike"] / spot)).abs()
 
     q = q.sort_values(["score", "q_mid"]).head(6)
-
-    # add some nice columns for display
-    q["idea"] = f"{action} " + ( "CALL" if side=="call" else "PUT" )
+    q["idea"] = f"{action} " + ("CALL" if side == "call" else "PUT")
     return q[["idea", "strike", "optionSymbol", "q_mid", "q_delta", "q_iv"]].reset_index(drop=True)
 
 def pick_wing_strike(strikes: np.ndarray, short_strike: float, wing_width: float, want_call: bool) -> float | None:
@@ -414,16 +415,11 @@ def quote_mid(sym: str) -> float | None:
     return float(q["mid"]) if np.isfinite(q["mid"]) else None
 
 def build_vertical_from_chain(chain: pd.DataFrame, spot: float, side: str, target_delta: float, wing_width: float, bearish_call: bool):
-    """
-    side: "put" or "call"
-    bearish_call=True means bear call spread, else bull put spread.
-    """
     df = chain.dropna(subset=["strike", "optionSymbol"]).copy()
     df = df[np.isfinite(df["strike"])]
     if df.empty:
         return None
 
-    # prefer OTM region
     if side == "call":
         df = df.sort_values("strike")
         df = df[df["strike"] >= spot].head(30) if (df["strike"] >= spot).any() else df.head(30)
@@ -431,18 +427,15 @@ def build_vertical_from_chain(chain: pd.DataFrame, spot: float, side: str, targe
         df = df.sort_values("strike", ascending=False)
         df = df[df["strike"] <= spot].head(30) if (df["strike"] <= spot).any() else df.head(30)
 
-    # Attach quotes for this reduced set
     dfq = attach_quotes(df)
     if dfq["q_mid"].notna().sum() < 2:
         return None
 
-    # pick short by delta if available, else %OTM
     if dfq["q_delta"].notna().any():
         desired = target_delta if side == "call" else -target_delta
         dfq["err"] = (dfq["q_delta"] - desired).abs()
         short_row = dfq.sort_values("err").iloc[0]
     else:
-        # fallback target 3% OTM
         tgt = spot * (1.03 if side == "call" else 0.97)
         dfq["err"] = (dfq["strike"] - tgt).abs()
         short_row = dfq.sort_values("err").iloc[0]
@@ -478,14 +471,12 @@ def build_vertical_from_chain(chain: pd.DataFrame, spot: float, side: str, targe
     return {"name": name, "credit": credit, "max_loss": max_loss, "legs": legs}
 
 def build_iron_condor(puts_chain, calls_chain, spot: float, target_delta: float, wing_width: float):
-    # Build put side (bull put) and call side (bear call) with same expiry
     put_spread = build_vertical_from_chain(puts_chain, spot, "put", target_delta, wing_width, bearish_call=False)
     call_spread = build_vertical_from_chain(calls_chain, spot, "call", target_delta, wing_width, bearish_call=True)
     if not put_spread or not call_spread:
         return None
 
     total_credit = put_spread["credit"] + call_spread["credit"]
-    # max loss approx = max(widths) - total_credit
     put_w = abs(put_spread["legs"][0][1] - put_spread["legs"][1][1])
     call_w = abs(call_spread["legs"][0][1] - call_spread["legs"][1][1])
     max_w = max(put_w, call_w)
@@ -496,19 +487,17 @@ def build_iron_condor(puts_chain, calls_chain, spot: float, target_delta: float,
             "put_credit": put_spread["credit"], "call_credit": call_spread["credit"]}
 
 # =========================================================
-# Session state: stop heavy reruns
+# Session state
 # =========================================================
 if "watchlist" not in st.session_state:
     st.session_state.watchlist = DEFAULT_WATCHLIST.copy()
-
 if "results" not in st.session_state:
     st.session_state.results = None
-
 if "last_params" not in st.session_state:
     st.session_state.last_params = None
 
 # =========================================================
-# Controls (RUN triggers refresh)
+# Controls
 # =========================================================
 st.markdown("<div class='card'>", unsafe_allow_html=True)
 with st.form("controls", clear_on_submit=False):
@@ -547,14 +536,12 @@ if not run and st.session_state.results is None:
     st.stop()
 
 # =========================================================
-# Refresh data ONLY when Run is pressed OR symbol changed
+# Refresh heavy data only on Run / symbol change
 # =========================================================
 params = {"symbol": symbol}
-
 if run or st.session_state.last_params != params:
     with st.spinner("Refreshing data…"):
         frames = fetch_timeframes(symbol)
-
         trend_matrix = {}
         latest_close = None
 
@@ -569,11 +556,8 @@ if run or st.session_state.last_params != params:
 
         auto_bias = decide_bias(trend_matrix)
         spot = float(latest_close) if latest_close is not None else np.nan
-
-        # "main trend" = 1D trend for strength/regime tuning
         main = trend_matrix.get("1D", {"strength": 50, "regime": "transition"})
         auto_cfg = auto_params_from_trend(auto_bias, int(main.get("strength", 50)), str(main.get("regime", "transition")))
-
         expirations = md_options_expirations(symbol) if get_marketdata_token() else None
 
         st.session_state.results = {
@@ -587,7 +571,7 @@ if run or st.session_state.last_params != params:
         st.session_state.last_params = params
 
 # =========================================================
-# Render results (NO heavy calls)
+# Render
 # =========================================================
 R = st.session_state.results
 frames = R["frames"]
@@ -608,7 +592,10 @@ st.markdown(
 for tf_name in ["15m", "4h", "1D"]:
     summ = trend_matrix.get(tf_name, {})
     df = frames.get(tf_name)
-    with st.expander(f"{tf_name} — {summ.get('direction','?')} ({summ.get('strength',0)}%) | {summ.get('regime','')} | {summ.get('notes','')}", expanded=(tf_name=="1D")):
+    with st.expander(
+        f"{tf_name} — {summ.get('direction','?')} ({summ.get('strength',0)}%) | {summ.get('regime','')} | {summ.get('notes','')}",
+        expanded=(tf_name == "1D")
+    ):
         if show_charts and df is not None and not df.empty:
             import matplotlib.pyplot as plt
             df_feat = compute_features(df)
@@ -628,9 +615,6 @@ for tf_name in ["15m", "4h", "1D"]:
 st.info(f"Auto bias (weighted): **{auto_bias.upper()}**")
 st.write(f"Spot: **{spot:.2f}**" if np.isfinite(spot) else "Spot: unavailable")
 
-# =========================================================
-# Options + recommendations (tabs) - only small quote calls
-# =========================================================
 if not show_options:
     st.stop()
 
@@ -643,25 +627,20 @@ if not expirations:
     st.stop()
 
 st.subheader("🧠 Auto Recommendations (Trend + Greeks)")
-
 tab1, tab2, tab3 = st.tabs(["Single Options (Auto)", "Credit Spreads (Auto)", "Manual Ticket"])
 
-# ---------------------------
-# Tab 1: Auto Single Options
-# ---------------------------
 with tab1:
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.write("These are **auto-picked** using trend bias + target delta. (Best results when MarketData quotes return delta.)")
+    st.write("Auto-picked using trend bias + target delta.")
 
     dte_min, dte_max = auto_cfg["dte_min"], auto_cfg["dte_max"]
     expiry = pick_expiration_in_dte_window(expirations, dte_min, dte_max)
     if not expiry:
         st.warning("No expiration found in the auto DTE window.")
-        st.markdown("</div>", unsafe_allow_html=True)
     else:
         pref = auto_cfg["single_pref"]
-        side = pref["side"]  # "call" or "put"
-        action = pref["action"]  # "BUY" / "SELL"
+        side = pref["side"]
+        action = pref["action"]
         target_delta = float(auto_cfg["target_delta"])
 
         chain = md_option_chain(symbol, expiry, side=side)
@@ -671,20 +650,15 @@ with tab1:
             recs = recommend_single_leg(chain, float(spot), side, action, target_delta)
             st.write(f"Chosen expiry: **{expiry}**")
             if recs is None or recs.empty:
-                st.warning("No recommendations (quotes/greeks missing). This usually means OPRA/quotes aren’t enabled on your MarketData plan.")
+                st.warning("No recommendations. Most common cause: quotes/OPRA not enabled on your MarketData plan.")
             else:
                 st.dataframe(recs, use_container_width=True)
-
     st.markdown("</div>", unsafe_allow_html=True)
 
-# ---------------------------
-# Tab 2: Auto Credit Spreads
-# ---------------------------
 with tab2:
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.write("Auto spreads based on bias + delta + your wing width. Uses per-leg quote mids.")
+    st.write("Auto spreads based on bias + delta + wing width.")
 
-    # Build DAILY + WEEKLY using auto delta
     target_delta = float(auto_cfg["target_delta"])
 
     def auto_spread_block(title: str, dte_min: int, dte_max: int):
@@ -709,7 +683,7 @@ with tab2:
 
         st.write(f"Chosen expiry: **{expiry}**")
         if not strat:
-            st.warning("Could not construct spread. (Most common cause: option quotes not available / OPRA not enabled.)")
+            st.warning("Could not construct spread. Most common cause: option quotes not available / OPRA not enabled.")
             return
 
         st.success(f"Recommended: **{strat['name']}**")
@@ -729,17 +703,12 @@ with tab2:
             cc = strat.get("call_credit", np.nan)
             if np.isfinite(pc) and np.isfinite(cc):
                 st.write(f"Put credit: {pc:.2f} | Call credit: {cc:.2f}")
-
         st.divider()
 
     auto_spread_block("📅 Daily Spread Idea", 0, 2)
     auto_spread_block("🗓️ Weekly Spread Idea", 5, 12)
-
     st.markdown("</div>", unsafe_allow_html=True)
 
-# ---------------------------
-# Tab 3: Manual Ticket (no rerun refetch)
-# ---------------------------
 with tab3:
     st.markdown("<div class='card'>", unsafe_allow_html=True)
 
@@ -784,9 +753,7 @@ with tab3:
                     st.info(f"{label} (mid): **${est:,.0f}**")
 
     else:
-        # manual spreads (uses your wing width slider + auto delta)
         target_delta = float(auto_cfg["target_delta"])
-
         calls = md_option_chain(symbol, expiry, side="call")
         puts = md_option_chain(symbol, expiry, side="put")
         if calls is None or puts is None or calls.empty or puts.empty:
@@ -800,7 +767,7 @@ with tab3:
                 strat = build_iron_condor(puts, calls, float(spot), target_delta, float(wing_width))
 
             if not strat:
-                st.warning("Could not construct spread. (Most common cause: quotes not available / OPRA not enabled.)")
+                st.warning("Could not construct spread. Most common cause: quotes not available / OPRA not enabled.")
             else:
                 st.success(f"Recommended: **{strat['name']}**")
                 for leg in strat["legs"]:
@@ -815,4 +782,4 @@ with tab3:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-st.caption("Note: Streamlit reruns the script on widget changes, but this app only refreshes data when you press RUN.")
+st.caption("Streamlit reruns the script on widget changes, but this app only refreshes heavy data when you press RUN.")
