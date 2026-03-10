@@ -21,7 +21,7 @@ DEFAULT_WATCHLIST = ["NVDA", "AAPL", "MSFT", "SPY", "QQQ", "TSLA", "AMD", "META"
 MD_BASE = "https://api.marketdata.app/v1"
 
 st.title("📈 Trend → Greeks → Options + Credit Spreads")
-st.caption("Educational only. Options trading involves substantial risk (assignment, gaps, liquidity).")
+st.caption("Educational only. This helps with trade structure and risk control, not guaranteed wins.")
 
 st.markdown(
     """
@@ -30,6 +30,8 @@ st.markdown(
 .card { border: 1px solid rgba(255,255,255,0.12); border-radius: 14px; padding: 14px; background: rgba(255,255,255,0.03); }
 .small-muted { opacity: 0.82; font-size: 0.92rem; }
 .pill { display:inline-block; padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.14); background: rgba(255,255,255,0.05); margin-right: 6px; }
+.good { color: #2ecc71; font-weight: 600; }
+.bad { color: #ff6b6b; font-weight: 600; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -286,18 +288,27 @@ def decide_bias(trend_matrix: dict) -> str:
 # =========================================================
 def auto_params_from_trend(auto_bias: str, strength: int, regime: str):
     if regime == "range":
-        delta = 0.15
+        spread_delta = 0.15
     elif strength >= 80:
-        delta = 0.25
+        spread_delta = 0.20
     elif strength >= 60:
-        delta = 0.20
+        spread_delta = 0.18
     else:
-        delta = 0.18
+        spread_delta = 0.15
+
+    if strength >= 80:
+        single_delta = 0.40
+    elif strength >= 60:
+        single_delta = 0.30
+    else:
+        single_delta = 0.25
 
     if regime == "range":
-        dte = (30, 45)
+        spread_dte = (30, 45)
+        single_dte = (14, 30)
     else:
-        dte = (7, 21)
+        spread_dte = (7, 21)
+        single_dte = (14, 30)
 
     if auto_bias == "bullish":
         single = {"side": "call", "action": "BUY"}
@@ -309,7 +320,16 @@ def auto_params_from_trend(auto_bias: str, strength: int, regime: str):
         single = {"side": "call", "action": "SELL"}
         spread = "Iron Condor"
 
-    return {"target_delta": delta, "dte_min": dte[0], "dte_max": dte[1], "single_pref": single, "spread_pref": spread}
+    return {
+        "single_target_delta": single_delta,
+        "spread_target_delta": spread_delta,
+        "single_dte_min": single_dte[0],
+        "single_dte_max": single_dte[1],
+        "spread_dte_min": spread_dte[0],
+        "spread_dte_max": spread_dte[1],
+        "single_pref": single,
+        "spread_pref": spread,
+    }
 
 def pick_expiration_in_dte_window(expirations: list[str], dte_min: int, dte_max: int) -> str | None:
     today = date.today()
@@ -381,14 +401,14 @@ def recommend_single_leg(chain: pd.DataFrame, spot: float, side: str, action: st
 
     if q["q_delta"].notna().any():
         desired = target_delta if side == "call" else -target_delta
-        q["score"] = (q["q_delta"] - desired).abs()
+        q["score_tmp"] = (q["q_delta"] - desired).abs()
     else:
         if side == "call":
-            q["score"] = ((q["strike"] / spot) - 1.0).abs()
+            q["score_tmp"] = ((q["strike"] / spot) - 1.0).abs()
         else:
-            q["score"] = (1.0 - (q["strike"] / spot)).abs()
+            q["score_tmp"] = (1.0 - (q["strike"] / spot)).abs()
 
-    q = q.sort_values(["score", "q_mid"]).head(6)
+    q = q.sort_values(["score_tmp", "q_mid"]).head(6)
     q["idea"] = f"{action} " + ("CALL" if side == "call" else "PUT")
     return q[["idea", "strike", "optionSymbol", "q_mid", "q_delta", "q_iv"]].reset_index(drop=True)
 
@@ -485,6 +505,166 @@ def build_iron_condor(puts_chain, calls_chain, spot: float, target_delta: float,
     legs = put_spread["legs"] + call_spread["legs"]
     return {"name": "Iron Condor", "credit": total_credit, "max_loss": max_loss, "legs": legs,
             "put_credit": put_spread["credit"], "call_credit": call_spread["credit"]}
+
+# =========================================================
+# Scoring helpers
+# =========================================================
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+def score_single_option(row: pd.Series, auto_bias: str, target_delta: float, dte: int):
+    score = 50
+    notes = []
+
+    delta = row.get("q_delta", np.nan)
+    iv = row.get("q_iv", np.nan)
+    mid = row.get("q_mid", np.nan)
+    idea = str(row.get("idea", ""))
+
+    if auto_bias == "bullish" and "CALL" in idea:
+        score += 15
+        notes.append("trend aligned")
+    elif auto_bias == "bearish" and "PUT" in idea:
+        score += 15
+        notes.append("trend aligned")
+    elif auto_bias == "neutral" and "SELL" in idea:
+        score += 8
+        notes.append("neutral fit")
+    else:
+        score -= 10
+        notes.append("trend mismatch")
+
+    if np.isfinite(delta):
+        desired = target_delta if "CALL" in idea else -target_delta
+        err = abs(delta - desired)
+        delta_pts = clamp(20 - (err * 100), 0, 20)
+        score += delta_pts
+        notes.append(f"delta err {err:.2f}")
+    else:
+        score -= 6
+        notes.append("no delta")
+
+    if 14 <= dte <= 30:
+        score += 10
+        notes.append("good DTE")
+    elif 7 <= dte <= 45:
+        score += 4
+    else:
+        score -= 6
+        notes.append("weak DTE")
+
+    if np.isfinite(iv):
+        if iv < 0.20:
+            score += 6
+            notes.append("lower IV")
+        elif iv <= 0.45:
+            score += 2
+        else:
+            score -= 6
+            notes.append("high IV")
+    else:
+        notes.append("no IV")
+
+    if np.isfinite(mid):
+        if "BUY" in idea:
+            if mid <= 1.5:
+                score += 6
+                notes.append("cheap premium")
+            elif mid <= 4.0:
+                score += 3
+            else:
+                score -= 5
+                notes.append("expensive premium")
+        else:
+            if mid >= 0.75:
+                score += 5
+                notes.append("decent premium")
+            else:
+                score -= 4
+                notes.append("thin premium")
+    else:
+        score -= 8
+        notes.append("no mid")
+
+    return int(clamp(round(score), 0, 100)), ", ".join(notes)
+
+def score_spread(strat: dict, auto_bias: str, dte: int):
+    score = 50
+    notes = []
+
+    name = strat.get("name", "")
+    credit = strat.get("credit", np.nan)
+    max_loss = strat.get("max_loss", np.nan)
+
+    if auto_bias == "bullish" and name == "Bull Put Spread":
+        score += 15
+        notes.append("trend aligned")
+    elif auto_bias == "bearish" and name == "Bear Call Spread":
+        score += 15
+        notes.append("trend aligned")
+    elif auto_bias == "neutral" and name == "Iron Condor":
+        score += 15
+        notes.append("neutral fit")
+    else:
+        score -= 10
+        notes.append("trend mismatch")
+
+    if 7 <= dte <= 21:
+        score += 10
+        notes.append("good DTE")
+    elif 22 <= dte <= 45:
+        score += 5
+    else:
+        score -= 5
+        notes.append("weak DTE")
+
+    if np.isfinite(credit):
+        if credit >= 0.80:
+            score += 10
+            notes.append("solid credit")
+        elif credit >= 0.40:
+            score += 6
+        elif credit >= 0.20:
+            score += 2
+        else:
+            score -= 8
+            notes.append("low credit")
+    else:
+        score -= 10
+        notes.append("no credit")
+
+    if np.isfinite(max_loss):
+        if max_loss <= 1.5:
+            score += 10
+            notes.append("tight risk")
+        elif max_loss <= 2.5:
+            score += 6
+        else:
+            score -= 6
+            notes.append("wide risk")
+    else:
+        score -= 10
+        notes.append("no risk calc")
+
+    if np.isfinite(credit) and np.isfinite(max_loss) and max_loss > 0:
+        rr = credit / max_loss
+        if rr >= 0.35:
+            score += 10
+            notes.append("good RR")
+        elif rr >= 0.20:
+            score += 5
+        else:
+            score -= 6
+            notes.append("weak RR")
+
+    return int(clamp(round(score), 0, 100)), ", ".join(notes)
+
+def score_color(score: int):
+    if score >= 80:
+        return "good"
+    if score >= 60:
+        return ""
+    return "bad"
 
 # =========================================================
 # Session state
@@ -584,8 +764,8 @@ expirations = R["expirations"]
 st.subheader(f"{symbol} — Trend scan (15m / 4h / 1D)")
 st.markdown(
     f"<span class='pill'>Bias: <b>{auto_bias.upper()}</b></span>"
-    f"<span class='pill'>Auto Δ: <b>{auto_cfg['target_delta']:.2f}</b></span>"
-    f"<span class='pill'>Auto DTE: <b>{auto_cfg['dte_min']}-{auto_cfg['dte_max']}</b></span>",
+    f"<span class='pill'>Single Δ: <b>{auto_cfg['single_target_delta']:.2f}</b></span>"
+    f"<span class='pill'>Spread Δ: <b>{auto_cfg['spread_target_delta']:.2f}</b></span>",
     unsafe_allow_html=True
 )
 
@@ -615,6 +795,14 @@ for tf_name in ["15m", "4h", "1D"]:
 st.info(f"Auto bias (weighted): **{auto_bias.upper()}**")
 st.write(f"Spot: **{spot:.2f}**" if np.isfinite(spot) else "Spot: unavailable")
 
+st.markdown("<div class='card'>", unsafe_allow_html=True)
+st.markdown("**Process reminders**")
+st.write(
+    "Take trades that match the higher timeframe bias, avoid chasing weak setups, and favor defined risk. "
+    "A high score does not mean guaranteed profit — it just means the structure fits your rules better."
+)
+st.markdown("</div>", unsafe_allow_html=True)
+
 if not show_options:
     st.stop()
 
@@ -631,9 +819,9 @@ tab1, tab2, tab3 = st.tabs(["Single Options (Auto)", "Credit Spreads (Auto)", "M
 
 with tab1:
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.write("Auto-picked using trend bias + target delta.")
+    st.write("Auto-picked using trend bias + a closer single-leg delta.")
 
-    dte_min, dte_max = auto_cfg["dte_min"], auto_cfg["dte_max"]
+    dte_min, dte_max = auto_cfg["single_dte_min"], auto_cfg["single_dte_max"]
     expiry = pick_expiration_in_dte_window(expirations, dte_min, dte_max)
     if not expiry:
         st.warning("No expiration found in the auto DTE window.")
@@ -641,7 +829,7 @@ with tab1:
         pref = auto_cfg["single_pref"]
         side = pref["side"]
         action = pref["action"]
-        target_delta = float(auto_cfg["target_delta"])
+        target_delta = float(auto_cfg["single_target_delta"])
 
         chain = md_option_chain(symbol, expiry, side=side)
         if chain is None or chain.empty:
@@ -652,14 +840,38 @@ with tab1:
             if recs is None or recs.empty:
                 st.warning("No recommendations. Most common cause: quotes/OPRA not enabled on your MarketData plan.")
             else:
-                st.dataframe(recs, use_container_width=True)
+                ed = datetime.strptime(expiry, "%Y-%m-%d").date()
+                dte = (ed - date.today()).days
+
+                scores = []
+                reasons = []
+                for _, row in recs.iterrows():
+                    s, why = score_single_option(row, auto_bias, target_delta, dte)
+                    scores.append(s)
+                    reasons.append(why)
+
+                recs["score"] = scores
+                recs["why"] = reasons
+                recs = recs.sort_values(["score", "q_mid"], ascending=[False, True]).reset_index(drop=True)
+
+                st.dataframe(
+                    recs[["score", "idea", "strike", "q_mid", "q_delta", "q_iv", "optionSymbol", "why"]],
+                    use_container_width=True
+                )
+
+                best = recs.iloc[0]
+                css = score_color(int(best["score"]))
+                st.markdown(
+                    f"Top idea: <span class='{css}'>Score {int(best['score'])}</span> — {best['idea']} {best['strike']}",
+                    unsafe_allow_html=True
+                )
     st.markdown("</div>", unsafe_allow_html=True)
 
 with tab2:
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.write("Auto spreads based on bias + delta + wing width.")
+    st.write("Auto spreads based on bias + spread delta + wing width.")
 
-    target_delta = float(auto_cfg["target_delta"])
+    target_delta = float(auto_cfg["spread_target_delta"])
 
     def auto_spread_block(title: str, dte_min: int, dte_max: int):
         st.markdown(f"**{title}**  <span class='small-muted'>(DTE {dte_min}-{dte_max})</span>", unsafe_allow_html=True)
@@ -685,6 +897,14 @@ with tab2:
         if not strat:
             st.warning("Could not construct spread. Most common cause: option quotes not available / OPRA not enabled.")
             return
+
+        ed = datetime.strptime(expiry, "%Y-%m-%d").date()
+        dte = (ed - date.today()).days
+        spread_score, spread_why = score_spread(strat, auto_bias, dte)
+        css = score_color(spread_score)
+
+        st.markdown(f"Trade score: <span class='{css}'>{spread_score}/100</span>", unsafe_allow_html=True)
+        st.caption(spread_why)
 
         st.success(f"Recommended: **{strat['name']}**")
         st.write("Legs:")
@@ -753,7 +973,7 @@ with tab3:
                     st.info(f"{label} (mid): **${est:,.0f}**")
 
     else:
-        target_delta = float(auto_cfg["target_delta"])
+        target_delta = float(auto_cfg["spread_target_delta"])
         calls = md_option_chain(symbol, expiry, side="call")
         puts = md_option_chain(symbol, expiry, side="put")
         if calls is None or puts is None or calls.empty or puts.empty:
@@ -769,6 +989,14 @@ with tab3:
             if not strat:
                 st.warning("Could not construct spread. Most common cause: quotes not available / OPRA not enabled.")
             else:
+                ed = datetime.strptime(expiry, "%Y-%m-%d").date()
+                dte = (ed - date.today()).days
+                spread_score, spread_why = score_spread(strat, auto_bias, dte)
+                css = score_color(spread_score)
+
+                st.markdown(f"Trade score: <span class='{css}'>{spread_score}/100</span>", unsafe_allow_html=True)
+                st.caption(spread_why)
+
                 st.success(f"Recommended: **{strat['name']}**")
                 for leg in strat["legs"]:
                     a, k, sym = leg
