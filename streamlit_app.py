@@ -13,7 +13,7 @@ import streamlit as st
 # =========================================================
 st.set_page_config(page_title="Options Scanner", layout="wide")
 st.title("Options Scanner - Single Legs + Credit Spreads")
-st.caption("Mobile-friendly layout with settings on the page instead of the sidebar.")
+st.caption("Mobile-friendly layout with settings on the page.")
 
 
 # =========================================================
@@ -192,26 +192,6 @@ def payload_to_frame(payload: dict) -> pd.DataFrame:
     return pd.DataFrame(normalized)
 
 
-def flatten_option_symbols(frame: pd.DataFrame) -> list[str]:
-    for col in ["optionSymbol", "option_symbol", "symbol", "option"]:
-        if col in frame.columns:
-            vals = frame[col].dropna().astype(str).tolist()
-            vals = [v for v in vals if v.strip()]
-            if vals:
-                return vals
-    return []
-
-
-def dedupe_keep_order(items):
-    seen = set()
-    out = []
-    for item in items:
-        if item not in seen:
-            seen.add(item)
-            out.append(item)
-    return out
-
-
 # =========================================================
 # API - MARKETDATA.APP
 # =========================================================
@@ -237,72 +217,47 @@ def fetch_underlying_quote(symbol: str, api_key: str) -> dict:
 
 def fetch_option_chain(symbol: str, api_key: str) -> pd.DataFrame:
     headers = {"Authorization": f"Bearer {api_key}"}
+    url = f"https://api.marketdata.app/v1/options/chain/{symbol.upper()}/"
+    params = {
+        "dateformat": "timestamp",
+        "range": "all",
+        "nonstandard": "false",
+        "minOpenInterest": DEFAULT_MIN_OI,
+        "minVolume": DEFAULT_MIN_VOL,
+        "expiration": f">{date.today().isoformat()}",
+    }
 
-    # Step 1: chain endpoint for contract discovery
-    chain_url = f"https://api.marketdata.app/v1/options/chain/{symbol.upper()}/"
-    chain_params = {"dateformat": "timestamp"}
+    resp = requests.get(url, headers=headers, params=params, timeout=DEFAULT_API_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
 
-    chain_resp = requests.get(chain_url, headers=headers, params=chain_params, timeout=DEFAULT_API_TIMEOUT)
-    chain_resp.raise_for_status()
-    chain_data = chain_resp.json()
-
-    chain_df = payload_to_frame(chain_data)
-    if chain_df.empty:
+    df = payload_to_frame(data)
+    if df.empty:
         return pd.DataFrame()
-
-    option_symbols = flatten_option_symbols(chain_df)
-    option_symbols = dedupe_keep_order(option_symbols)
-
-    if not option_symbols:
-        return pd.DataFrame()
-
-    # Step 2: quotes endpoint for real quote fields
-    quote_frames = []
-    chunk_size = 50
-
-    for i in range(0, len(option_symbols), chunk_size):
-        chunk = option_symbols[i:i + chunk_size]
-        joined = ",".join(chunk)
-
-        quotes_url = f"https://api.marketdata.app/v1/options/quotes/{joined}/"
-        quote_params = {"dateformat": "timestamp"}
-
-        q_resp = requests.get(quotes_url, headers=headers, params=quote_params, timeout=DEFAULT_API_TIMEOUT)
-        q_resp.raise_for_status()
-        q_data = q_resp.json()
-
-        q_df = payload_to_frame(q_data)
-        if not q_df.empty:
-            quote_frames.append(q_df)
-
-    if not quote_frames:
-        return pd.DataFrame()
-
-    quotes_df = pd.concat(quote_frames, ignore_index=True)
 
     rename_map = {
         "underlying": "symbol",
-        "ticker": "symbol",
         "expiration": "expiration",
-        "expirationDate": "expiration",
         "side": "option_type",
         "type": "option_type",
         "strike": "strike",
         "bid": "bid",
         "ask": "ask",
+        "mid": "mid",
         "last": "last",
-        "lastPrice": "last",
         "delta": "delta",
         "iv": "iv",
         "openInterest": "oi",
         "volume": "volume",
         "updated": "timestamp",
         "optionSymbol": "optionSymbol",
+        "dte": "dte",
+        "underlyingPrice": "underlyingPrice",
     }
-    quotes_df = quotes_df.rename(columns={k: v for k, v in rename_map.items() if k in quotes_df.columns})
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
-    if "symbol" not in quotes_df.columns:
-        quotes_df["symbol"] = symbol.upper()
+    if "symbol" not in df.columns:
+        df["symbol"] = symbol.upper()
 
     needed_cols = [
         "symbol",
@@ -311,6 +266,7 @@ def fetch_option_chain(symbol: str, api_key: str) -> pd.DataFrame:
         "strike",
         "bid",
         "ask",
+        "mid",
         "last",
         "delta",
         "iv",
@@ -318,20 +274,22 @@ def fetch_option_chain(symbol: str, api_key: str) -> pd.DataFrame:
         "volume",
         "timestamp",
         "optionSymbol",
+        "dte",
+        "underlyingPrice",
     ]
     for col in needed_cols:
-        if col not in quotes_df.columns:
-            quotes_df[col] = np.nan
+        if col not in df.columns:
+            df[col] = np.nan
 
-    quotes_df["option_type"] = (
-        quotes_df["option_type"]
+    df["option_type"] = (
+        df["option_type"]
         .astype(str)
         .str.strip()
         .str.lower()
         .replace({"p": "put", "c": "call"})
     )
 
-    return quotes_df[needed_cols].copy()
+    return df[needed_cols].copy()
 
 
 # =========================================================
@@ -364,6 +322,7 @@ def normalize_chain(chain: pd.DataFrame, symbol: Optional[str] = None) -> pd.Dat
         "strike": np.nan,
         "bid": np.nan,
         "ask": np.nan,
+        "mid": np.nan,
         "last": np.nan,
         "delta": np.nan,
         "iv": np.nan,
@@ -371,6 +330,7 @@ def normalize_chain(chain: pd.DataFrame, symbol: Optional[str] = None) -> pd.Dat
         "volume": 0,
         "timestamp": None,
         "optionSymbol": None,
+        "underlyingPrice": np.nan,
     }
 
     for col, default in needed.items():
@@ -388,13 +348,19 @@ def normalize_chain(chain: pd.DataFrame, symbol: Optional[str] = None) -> pd.Dat
         .replace({"p": "put", "c": "call"})
     )
 
-    num_cols = ["dte", "strike", "bid", "ask", "last", "delta", "iv", "oi", "volume"]
+    num_cols = ["dte", "strike", "bid", "ask", "mid", "last", "delta", "iv", "oi", "volume", "underlyingPrice"]
     for col in num_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df["expiration_dt"] = pd.to_datetime(df["expiration"], errors="coerce")
     df["dte"] = np.where(df["dte"].notna(), df["dte"], df["expiration"].apply(calc_dte))
-    df["mid"] = df.apply(lambda r: option_mid(r["bid"], r["ask"], r["last"]), axis=1)
+
+    df["mid"] = np.where(
+        df["mid"].notna(),
+        df["mid"],
+        df.apply(lambda r: option_mid(r["bid"], r["ask"], r["last"]), axis=1)
+    )
+
     df["spread_pct"] = df.apply(lambda r: pct_bid_ask_spread(r["bid"], r["ask"]), axis=1)
     df["delta_abs"] = df["delta"].abs()
 
@@ -707,7 +673,7 @@ def build_debug_view(chain: pd.DataFrame):
         c for c in [
             "symbol", "expiration", "dte", "option_type", "strike",
             "bid", "ask", "last", "mid", "spread_pct", "delta", "delta_abs",
-            "iv", "oi", "volume", "timestamp", "optionSymbol"
+            "iv", "oi", "volume", "timestamp", "optionSymbol", "underlyingPrice"
         ] if c in chain.columns
     ]
     return chain[cols].copy()
@@ -756,13 +722,21 @@ def load_symbol_data(symbol: str, api_key: str):
 
 
 # =========================================================
-# SETTINGS PANEL (NO SIDEBAR)
+# SETTINGS PANEL
 # =========================================================
+saved_api_key = st.secrets.get("MARKETDATA_API_KEY", "")
+
 with st.expander("Scanner Settings", expanded=True):
     c1, c2 = st.columns(2)
 
     with c1:
-        api_key = st.text_input("API Key", type="password")
+        st.text_input(
+            "API Key",
+            type="password",
+            value="",
+            placeholder="Loaded from Streamlit secrets" if saved_api_key else "Add MARKETDATA_API_KEY to secrets",
+            disabled=True if saved_api_key else False,
+        )
         symbol_input = st.text_input("Symbols (comma separated)", value="SPY,QQQ,AMD")
         account_size = st.number_input(
             "Account Size",
@@ -790,6 +764,7 @@ with st.expander("Scanner Settings", expanded=True):
         min_credit_pct_width = st.slider("Min Credit % Width", 0.05, 0.80, DEFAULT_MIN_CREDIT_PCT_WIDTH, 0.01)
         max_credit_pct_width = st.slider("Max Credit % Width", 0.05, 0.95, DEFAULT_MAX_CREDIT_PCT_WIDTH, 0.01)
 
+api_key = saved_api_key
 run_scan = st.button("Load Data / Scan", use_container_width=True)
 
 
@@ -805,7 +780,7 @@ if not run_scan:
 else:
     try:
         if not api_key:
-            st.warning("Add your API key above.")
+            st.warning("Add MARKETDATA_API_KEY to Streamlit secrets.")
         else:
             all_quotes = {}
             chain_parts = []
@@ -853,14 +828,19 @@ else:
                     single_symbol = st.selectbox("Symbol", options=symbols, index=0, key="single_symbol")
 
                     quote = all_quotes.get(single_symbol, {})
+                    single_df = full_chain[full_chain["symbol"] == single_symbol].copy()
+
                     spot = safe_float(quote.get("spot"), np.nan)
+                    if "underlyingPrice" in single_df.columns:
+                        valid_chain_spots = single_df["underlyingPrice"].dropna()
+                        if not valid_chain_spots.empty:
+                            spot = safe_float(valid_chain_spots.iloc[0], spot)
 
                     if not np.isfinite(spot):
                         st.error(f"No valid spot price for {single_symbol}.")
                     else:
                         st.write(f"Spot: **{spot:.2f}**")
 
-                        single_df = full_chain[full_chain["symbol"] == single_symbol].copy()
                         single_results = scan_single_legs(
                             chain=single_df,
                             spot=spot,
