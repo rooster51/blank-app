@@ -220,11 +220,10 @@ def fetch_option_chain(symbol: str, api_key: str) -> pd.DataFrame:
     url = f"https://api.marketdata.app/v1/options/chain/{symbol.upper()}/"
     params = {
         "dateformat": "timestamp",
-        "range": "all",
+        "expiration": "all",
         "nonstandard": "false",
         "minOpenInterest": DEFAULT_MIN_OI,
         "minVolume": DEFAULT_MIN_VOL,
-        "expiration": f">{date.today().isoformat()}",
     }
 
     resp = requests.get(url, headers=headers, params=params, timeout=DEFAULT_API_TIMEOUT)
