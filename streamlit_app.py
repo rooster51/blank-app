@@ -13,7 +13,7 @@ import streamlit as st
 # =========================================================
 st.set_page_config(page_title="Options Scanner", layout="wide")
 st.title("Options Scanner - Single Legs + Credit Spreads")
-st.caption("Mobile-friendly layout with settings on the page.")
+st.caption("Mobile-friendly layout with all controls on the page. No sidebar.")
 
 
 # =========================================================
@@ -24,12 +24,8 @@ DEFAULT_MAX_RISK_PCT = 0.25
 DEFAULT_TOTAL_RISK_CAP_PCT = 0.50
 DEFAULT_MIN_DTE = 20
 DEFAULT_MAX_DTE = 45
-DEFAULT_SHORT_DELTA_MIN = 0.20
-DEFAULT_SHORT_DELTA_MAX = 0.30
 DEFAULT_SINGLE_DELTA_MIN = 0.20
 DEFAULT_SINGLE_DELTA_MAX = 0.40
-DEFAULT_MIN_CREDIT_PCT_WIDTH = 0.25
-DEFAULT_MAX_CREDIT_PCT_WIDTH = 0.40
 DEFAULT_MAX_BID_ASK_PCT = 0.20
 DEFAULT_TAKE_PROFIT_PCT = 0.50
 DEFAULT_MIN_OI = 25
@@ -190,6 +186,80 @@ def payload_to_frame(payload: dict) -> pd.DataFrame:
             normalized[key] = value + [None] * (max_len - len(value))
 
     return pd.DataFrame(normalized)
+
+
+def project_growth_fixed(
+    start_balance: float,
+    avg_win: float,
+    avg_loss: float,
+    win_rate: float,
+    num_trades: int,
+):
+    balance = safe_float(start_balance, 0.0)
+    win_rate = safe_float(win_rate, 0.0)
+
+    history = []
+    for i in range(1, num_trades + 1):
+        expected_trade_pl = (win_rate * avg_win) - ((1.0 - win_rate) * avg_loss)
+        balance += expected_trade_pl
+        history.append({
+            "trade_num": i,
+            "expected_balance": round(balance, 2),
+            "expected_trade_pl": round(expected_trade_pl, 2),
+        })
+
+    return pd.DataFrame(history)
+
+
+def project_growth_pct(
+    start_balance: float,
+    avg_return_pct_per_trade: float,
+    num_trades: int,
+):
+    balance = safe_float(start_balance, 0.0)
+    r = safe_float(avg_return_pct_per_trade, 0.0)
+
+    history = []
+    for i in range(1, num_trades + 1):
+        balance *= (1.0 + r)
+        history.append({
+            "trade_num": i,
+            "projected_balance": round(balance, 2),
+            "avg_return_pct": round(r * 100.0, 2),
+        })
+
+    return pd.DataFrame(history)
+
+
+def estimate_growth_from_top_spread(
+    credit: float,
+    max_risk: float,
+    win_rate: float,
+    account_size: float,
+    num_trades: int,
+):
+    avg_win = safe_float(credit, 0.0)
+    avg_loss = safe_float(max_risk, 0.0)
+    win_rate = safe_float(win_rate, 0.0)
+
+    fixed_df = project_growth_fixed(
+        start_balance=account_size,
+        avg_win=avg_win,
+        avg_loss=avg_loss,
+        win_rate=win_rate,
+        num_trades=num_trades,
+    )
+
+    ev_per_trade = (win_rate * avg_win) - ((1.0 - win_rate) * avg_loss)
+    avg_return_pct = ev_per_trade / account_size if account_size > 0 else 0.0
+
+    pct_df = project_growth_pct(
+        start_balance=account_size,
+        avg_return_pct_per_trade=avg_return_pct,
+        num_trades=num_trades,
+    )
+
+    return fixed_df, pct_df, ev_per_trade, avg_return_pct
 
 
 # =========================================================
@@ -464,10 +534,6 @@ def build_vertical_spreads_for_expiration(
     strategy: str,
     max_width: float,
     max_risk_dollars: float,
-    short_delta_min: float,
-    short_delta_max: float,
-    min_credit_pct_width: float,
-    max_credit_pct_width: float,
     require_liquidity: bool,
 ):
     rows = []
@@ -487,13 +553,9 @@ def build_vertical_spreads_for_expiration(
 
     for _, short_row in sub.iterrows():
         short_delta_abs = safe_float(short_row["delta_abs"], np.nan)
-        if not np.isfinite(short_delta_abs):
-            continue
-        if not (short_delta_min <= short_delta_abs <= short_delta_max):
-            continue
-
         short_strike = safe_float(short_row["strike"], np.nan)
         short_mid = safe_float(short_row["mid"], np.nan)
+
         if not np.isfinite(short_strike) or not np.isfinite(short_mid):
             continue
 
@@ -510,6 +572,7 @@ def build_vertical_spreads_for_expiration(
         for _, long_row in candidates.iterrows():
             long_strike = safe_float(long_row["strike"], np.nan)
             long_mid = safe_float(long_row["mid"], np.nan)
+
             if not np.isfinite(long_strike) or not np.isfinite(long_mid):
                 continue
 
@@ -529,20 +592,18 @@ def build_vertical_spreads_for_expiration(
             if max_risk <= 0 or max_risk > max_risk_dollars:
                 continue
 
-            credit_pct_width = credit / width
-            if not (min_credit_pct_width <= credit_pct_width <= max_credit_pct_width):
-                continue
+            pop = approx_pop_from_short_delta(short_delta_abs) if np.isfinite(short_delta_abs) else np.nan
+            ev = expected_value(credit_dollars, max_risk, pop) if np.isfinite(pop) else np.nan
+            score = spread_score(credit_dollars, max_risk, pop) if np.isfinite(pop) else np.nan
 
-            pop = approx_pop_from_short_delta(short_delta_abs)
-            ev = expected_value(credit_dollars, max_risk, pop)
-            score = spread_score(credit_dollars, max_risk, pop)
-
-            fair_credit = fair_credit_heuristic(width, pop) * 100.0
-            edge_dollars = credit_dollars - fair_credit
-            lottery_flag = edge_dollars >= 7.5
+            fair_credit = fair_credit_heuristic(width, pop) * 100.0 if np.isfinite(pop) else np.nan
+            edge_dollars = credit_dollars - fair_credit if np.isfinite(fair_credit) else np.nan
+            lottery_flag = bool(np.isfinite(edge_dollars) and edge_dollars >= 7.5)
 
             take_profit_dollars = credit_dollars * DEFAULT_TAKE_PROFIT_PCT
             buyback_target_dollars = credit_dollars * (1.0 - DEFAULT_TAKE_PROFIT_PCT)
+
+            credit_pct_width = credit / width if width > 0 else np.nan
 
             rows.append({
                 "symbol": symbol,
@@ -563,12 +624,12 @@ def build_vertical_spreads_for_expiration(
                 "long_mid": long_mid,
                 "credit": round(credit_dollars, 2),
                 "max_risk": round(max_risk, 2),
-                "credit_pct_width": round(credit_pct_width, 4),
-                "pop": round(pop, 4),
-                "ev": round(ev, 2),
-                "score": round(score, 4),
-                "fair_credit_heuristic": round(fair_credit, 2),
-                "edge_dollars": round(edge_dollars, 2),
+                "credit_pct_width": round(credit_pct_width, 4) if np.isfinite(credit_pct_width) else np.nan,
+                "pop": round(pop, 4) if np.isfinite(pop) else np.nan,
+                "ev": round(ev, 2) if np.isfinite(ev) else np.nan,
+                "score": round(score, 4) if np.isfinite(score) else np.nan,
+                "fair_credit_heuristic": round(fair_credit, 2) if np.isfinite(fair_credit) else np.nan,
+                "edge_dollars": round(edge_dollars, 2) if np.isfinite(edge_dollars) else np.nan,
                 "lottery_flag": lottery_flag,
                 "take_profit_dollars": round(take_profit_dollars, 2),
                 "buyback_target_dollars": round(buyback_target_dollars, 2),
@@ -585,10 +646,6 @@ def scan_credit_spreads(
     min_dte: int,
     max_dte: int,
     max_width: float,
-    short_delta_min: float,
-    short_delta_max: float,
-    min_credit_pct_width: float,
-    max_credit_pct_width: float,
     require_liquidity: bool,
 ):
     df = chain.copy()
@@ -618,10 +675,6 @@ def scan_credit_spreads(
                 strategy="bull_put",
                 max_width=max_width,
                 max_risk_dollars=max_risk_dollars,
-                short_delta_min=short_delta_min,
-                short_delta_max=short_delta_max,
-                min_credit_pct_width=min_credit_pct_width,
-                max_credit_pct_width=max_credit_pct_width,
                 require_liquidity=require_liquidity,
             )
 
@@ -632,10 +685,6 @@ def scan_credit_spreads(
                 strategy="bear_call",
                 max_width=max_width,
                 max_risk_dollars=max_risk_dollars,
-                short_delta_min=short_delta_min,
-                short_delta_max=short_delta_max,
-                min_credit_pct_width=min_credit_pct_width,
-                max_credit_pct_width=max_credit_pct_width,
                 require_liquidity=require_liquidity,
             )
 
@@ -657,8 +706,8 @@ def scan_credit_spreads(
     out["roi_pct"] = (out["roi_on_risk"] * 100.0).round(1)
 
     out = out.sort_values(
-        ["score", "ev", "edge_dollars", "pop"],
-        ascending=[False, False, False, False]
+        ["ev", "credit", "score"],
+        ascending=[False, False, False]
     ).reset_index(drop=True)
 
     return out
@@ -721,7 +770,7 @@ def load_symbol_data(symbol: str, api_key: str):
 
 
 # =========================================================
-# SETTINGS PANEL
+# SETTINGS PANEL - NO SIDEBAR
 # =========================================================
 saved_api_key = st.secrets.get("MARKETDATA_API_KEY", "")
 
@@ -756,12 +805,8 @@ with st.expander("Scanner Settings", expanded=True):
         min_dte = st.number_input("Min DTE", min_value=1, value=DEFAULT_MIN_DTE, step=1)
         max_dte = st.number_input("Max DTE", min_value=1, value=DEFAULT_MAX_DTE, step=1)
         max_width = st.selectbox("Max Spread Width", options=[1.0, 2.0, 3.0, 5.0], index=1)
-        short_delta_min = st.slider("Short Delta Min", 0.05, 0.50, DEFAULT_SHORT_DELTA_MIN, 0.01)
-        short_delta_max = st.slider("Short Delta Max", 0.05, 0.50, DEFAULT_SHORT_DELTA_MAX, 0.01)
         single_delta_min = st.slider("Single-Leg Delta Min", 0.05, 0.80, DEFAULT_SINGLE_DELTA_MIN, 0.01)
         single_delta_max = st.slider("Single-Leg Delta Max", 0.05, 0.80, DEFAULT_SINGLE_DELTA_MAX, 0.01)
-        min_credit_pct_width = st.slider("Min Credit % Width", 0.05, 0.80, DEFAULT_MIN_CREDIT_PCT_WIDTH, 0.01)
-        max_credit_pct_width = st.slider("Max Credit % Width", 0.05, 0.95, DEFAULT_MAX_CREDIT_PCT_WIDTH, 0.01)
 
 api_key = saved_api_key
 run_scan = st.button("Load Data / Scan", use_container_width=True)
@@ -770,7 +815,7 @@ run_scan = st.button("Load Data / Scan", use_container_width=True)
 # =========================================================
 # MAIN
 # =========================================================
-tabs = st.tabs(["Overview", "Single Legs", "Credit Spreads", "Debug"])
+tabs = st.tabs(["Overview", "Single Legs", "Credit Spreads", "Growth", "Debug"])
 symbols = [s.strip().upper() for s in symbol_input.split(",") if s.strip()]
 
 if not run_scan:
@@ -889,10 +934,6 @@ Score: **{top['score']:.3f}**
                         min_dte=min_dte,
                         max_dte=max_dte,
                         max_width=max_width,
-                        short_delta_min=short_delta_min,
-                        short_delta_max=short_delta_max,
-                        min_credit_pct_width=min_credit_pct_width,
-                        max_credit_pct_width=max_credit_pct_width,
                         require_liquidity=require_liquidity,
                     )
 
@@ -904,11 +945,24 @@ Score: **{top['score']:.3f}**
 
                         show_cols = [
                             "symbol", "expiration", "dte", "spread_name",
-                            "credit", "max_risk", "pop_pct", "roi_pct",
-                            "ev", "score", "edge_dollars",
+                            "short_delta", "credit", "credit_pct_width", "max_risk",
+                            "pop_pct", "roi_pct", "ev", "score", "edge_dollars",
                             "take_profit_dollars", "buyback_target_dollars", "lottery_flag"
                         ]
                         st.dataframe(disp[show_cols], use_container_width=True, hide_index=True)
+
+                        st.markdown("### Top 5 Spread Cards")
+                        for _, row in disp.head(5).iterrows():
+                            st.markdown(
+                                f"""
+**{row['symbol']} — {row['spread_name']}**  
+DTE: **{int(row['dte'])}** | Short Delta: **{row['short_delta']:.3f}**  
+Credit: **${row['credit']:.2f}** | Risk: **${row['max_risk']:.2f}**  
+POP: **{row['pop_pct']:.1f}%** | ROI: **{row['roi_pct']:.1f}%**  
+EV: **${row['ev']:.2f}** | TP: **${row['take_profit_dollars']:.2f}**
+"""
+                            )
+                            st.divider()
 
                         top = spread_results.iloc[0]
                         qty = contracts_allowed(
@@ -923,6 +977,7 @@ Score: **{top['score']:.3f}**
 **{top['symbol']} - {top['spread_name']}**  
 Expiration: **{top['expiration']}**  
 DTE: **{int(top['dte'])}**  
+Short Delta: **{top['short_delta']:.3f}**  
 Credit: **${top['credit']:.2f}**  
 Max Risk: **${top['max_risk']:.2f}**  
 POP: **{top['pop_pct']:.1f}%**  
@@ -945,6 +1000,71 @@ Short Delta: **{top['short_delta']:.3f}**
                         )
 
                 with tabs[3]:
+                    st.subheader("Portfolio Growth Projection")
+
+                    growth_symbol = st.selectbox("Growth Model Symbol", options=symbols, index=0, key="growth_symbol")
+                    growth_trades = st.number_input("Number of Trades", min_value=1, value=25, step=1)
+                    assumed_win_rate = st.slider("Assumed Win Rate", 0.30, 0.95, 0.70, 0.01)
+
+                    growth_df_source = full_chain[full_chain["symbol"] == growth_symbol].copy()
+
+                    growth_spreads = scan_credit_spreads(
+                        chain=growth_df_source,
+                        account_size=account_size,
+                        max_risk_pct=max_risk_pct,
+                        min_dte=min_dte,
+                        max_dte=max_dte,
+                        max_width=max_width,
+                        require_liquidity=require_liquidity,
+                    )
+
+                    if growth_spreads.empty:
+                        st.info("No spreads available for growth projection.")
+                    else:
+                        model_trade = growth_spreads.iloc[0]
+
+                        fixed_df, pct_df, ev_per_trade, avg_return_pct = estimate_growth_from_top_spread(
+                            credit=model_trade["credit"],
+                            max_risk=model_trade["max_risk"],
+                            win_rate=assumed_win_rate,
+                            account_size=account_size,
+                            num_trades=int(growth_trades),
+                        )
+
+                        end_fixed = fixed_df.iloc[-1]["expected_balance"] if not fixed_df.empty else account_size
+                        end_pct = pct_df.iloc[-1]["projected_balance"] if not pct_df.empty else account_size
+
+                        c1, c2, c3 = st.columns(3)
+                        with c1:
+                            st.metric("Starting Balance", f"${account_size:,.2f}")
+                        with c2:
+                            st.metric("Expected P/L Per Trade", f"${ev_per_trade:,.2f}")
+                        with c3:
+                            st.metric("Avg Return / Trade", f"{avg_return_pct * 100:.2f}%")
+
+                        st.markdown("### Model Trade Used")
+                        st.write(
+                            f"""
+**{model_trade['symbol']} - {model_trade['spread_name']}**  
+Short Delta: **{model_trade['short_delta']:.3f}**  
+Credit: **${model_trade['credit']:.2f}**  
+Max Risk: **${model_trade['max_risk']:.2f}**  
+Assumed Win Rate: **{assumed_win_rate * 100:.1f}%**
+"""
+                        )
+
+                        st.markdown("### Ending Balance Estimates")
+                        c4, c5 = st.columns(2)
+                        with c4:
+                            st.metric("Fixed EV Model", f"${end_fixed:,.2f}")
+                        with c5:
+                            st.metric("Compounded EV Model", f"${end_pct:,.2f}")
+
+                        st.markdown("### Trade-by-Trade Projection")
+                        merged = fixed_df.merge(pct_df, on="trade_num", how="outer")
+                        st.dataframe(merged, use_container_width=True, hide_index=True)
+
+                with tabs[4]:
                     st.subheader("Debug")
 
                     debug_symbol = st.selectbox("Debug Symbol", options=symbols, index=0, key="debug_symbol")
