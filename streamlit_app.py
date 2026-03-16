@@ -292,8 +292,6 @@ def fetch_option_chain(symbol: str, api_key: str) -> pd.DataFrame:
         "dateformat": "timestamp",
         "expiration": "all",
         "nonstandard": "false",
-        "minOpenInterest": DEFAULT_MIN_OI,
-        "minVolume": DEFAULT_MIN_VOL,
     }
 
     resp = requests.get(url, headers=headers, params=params, timeout=DEFAULT_API_TIMEOUT)
@@ -864,6 +862,13 @@ else:
 
                     st.write(f"Contracts loaded: **{len(full_chain):,}**")
                     st.write(f"Symbols loaded: **{', '.join(sorted(full_chain['symbol'].unique()))}**")
+
+                    st.write("Raw expirations:", sorted(full_chain["expiration"].dropna().astype(str).unique().tolist()))
+                    st.write("Option types:", full_chain["option_type"].value_counts(dropna=False).to_dict())
+                    st.write("DTE range:", {
+                        "min": safe_float(full_chain["dte"].min(), np.nan),
+                        "max": safe_float(full_chain["dte"].max(), np.nan),
+                    })
 
                 with tabs[1]:
                     st.subheader("Single-Leg Scanner")
