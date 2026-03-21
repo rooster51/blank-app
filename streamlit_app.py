@@ -1,5 +1,5 @@
 import math
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional
 
 import numpy as np
@@ -13,7 +13,7 @@ import streamlit as st
 # =========================================================
 st.set_page_config(page_title="Options Scanner", layout="wide")
 st.title("Options Scanner - Single Legs + Credit Spreads")
-st.caption("Mobile-friendly layout with all controls on the page. No sidebar.")
+st.caption("Trend-aware, mobile-friendly layout with no sidebar.")
 
 
 # =========================================================
@@ -188,13 +188,7 @@ def payload_to_frame(payload: dict) -> pd.DataFrame:
     return pd.DataFrame(normalized)
 
 
-def project_growth_fixed(
-    start_balance: float,
-    avg_win: float,
-    avg_loss: float,
-    win_rate: float,
-    num_trades: int,
-):
+def project_growth_fixed(start_balance: float, avg_win: float, avg_loss: float, win_rate: float, num_trades: int):
     balance = safe_float(start_balance, 0.0)
     win_rate = safe_float(win_rate, 0.0)
 
@@ -202,42 +196,36 @@ def project_growth_fixed(
     for i in range(1, num_trades + 1):
         expected_trade_pl = (win_rate * avg_win) - ((1.0 - win_rate) * avg_loss)
         balance += expected_trade_pl
-        history.append({
-            "trade_num": i,
-            "expected_balance": round(balance, 2),
-            "expected_trade_pl": round(expected_trade_pl, 2),
-        })
+        history.append(
+            {
+                "trade_num": i,
+                "expected_balance": round(balance, 2),
+                "expected_trade_pl": round(expected_trade_pl, 2),
+            }
+        )
 
     return pd.DataFrame(history)
 
 
-def project_growth_pct(
-    start_balance: float,
-    avg_return_pct_per_trade: float,
-    num_trades: int,
-):
+def project_growth_pct(start_balance: float, avg_return_pct_per_trade: float, num_trades: int):
     balance = safe_float(start_balance, 0.0)
     r = safe_float(avg_return_pct_per_trade, 0.0)
 
     history = []
     for i in range(1, num_trades + 1):
         balance *= (1.0 + r)
-        history.append({
-            "trade_num": i,
-            "projected_balance": round(balance, 2),
-            "avg_return_pct": round(r * 100.0, 2),
-        })
+        history.append(
+            {
+                "trade_num": i,
+                "projected_balance": round(balance, 2),
+                "avg_return_pct": round(r * 100.0, 2),
+            }
+        )
 
     return pd.DataFrame(history)
 
 
-def estimate_growth_from_top_spread(
-    credit: float,
-    max_risk: float,
-    win_rate: float,
-    account_size: float,
-    num_trades: int,
-):
+def estimate_growth_from_top_spread(credit: float, max_risk: float, win_rate: float, account_size: float, num_trades: int):
     avg_win = safe_float(credit, 0.0)
     avg_loss = safe_float(max_risk, 0.0)
     win_rate = safe_float(win_rate, 0.0)
@@ -262,36 +250,102 @@ def estimate_growth_from_top_spread(
     return fixed_df, pct_df, ev_per_trade, avg_return_pct
 
 
+def classify_trend_from_candles(candles: pd.DataFrame) -> dict:
+    if candles.empty or "c" not in candles.columns or len(candles) < 50:
+        return {
+            "trend": "Unknown",
+            "last_close": np.nan,
+            "sma20": np.nan,
+            "sma50": np.nan,
+        }
+
+    df = candles.copy().sort_values("t")
+    df["sma20"] = df["c"].rolling(20).mean()
+    df["sma50"] = df["c"].rolling(50).mean()
+
+    last_close = safe_float(df["c"].iloc[-1], np.nan)
+    sma20 = safe_float(df["sma20"].iloc[-1], np.nan)
+    sma50 = safe_float(df["sma50"].iloc[-1], np.nan)
+
+    if np.isfinite(last_close) and np.isfinite(sma20) and np.isfinite(sma50):
+        if last_close > sma20 > sma50:
+            trend = "Uptrend"
+        elif last_close < sma20 < sma50:
+            trend = "Downtrend"
+        else:
+            trend = "Neutral"
+    else:
+        trend = "Unknown"
+
+    return {
+        "trend": trend,
+        "last_close": round(last_close, 2) if np.isfinite(last_close) else np.nan,
+        "sma20": round(sma20, 2) if np.isfinite(sma20) else np.nan,
+        "sma50": round(sma50, 2) if np.isfinite(sma50) else np.nan,
+    }
+
+
+def allowed_strategies_from_trend(trend: str) -> list[str]:
+    if trend == "Uptrend":
+        return ["bull_put"]
+    if trend == "Downtrend":
+        return ["bear_call"]
+    return ["bull_put", "bear_call"]
+
+
 # =========================================================
 # API - MARKETDATA.APP
 # =========================================================
-def fetch_underlying_quote(symbol: str, api_key: str) -> dict:
+def fetch_stock_candles(symbol: str, api_key: str, countback: int = 60) -> pd.DataFrame:
     headers = {"Authorization": f"Bearer {api_key}"}
-    url = f"https://api.marketdata.app/v1/stocks/quotes/{symbol.upper()}/"
-    params = {"dateformat": "timestamp"}
+    url = f"https://api.marketdata.app/v1/stocks/candles/D/{symbol.upper()}/"
+    params = {
+        "countback": countback,
+        "dateformat": "timestamp",
+    }
 
     resp = requests.get(url, headers=headers, params=params, timeout=DEFAULT_API_TIMEOUT)
     resp.raise_for_status()
     data = resp.json()
 
-    spot = safe_float(first_valid_value(data, ["mid", "last", "price", "close"]), np.nan)
-    timestamp = first_valid_value(data, ["updated", "timestamp", "s"])
+    if not isinstance(data, dict) or data.get("s") != "ok":
+        return pd.DataFrame()
 
-    return {
-        "symbol": symbol.upper(),
-        "spot": spot,
-        "timestamp": timestamp,
-        "raw": data,
-    }
+    candles = pd.DataFrame(
+        {
+            "t": data.get("t", []),
+            "o": data.get("o", []),
+            "h": data.get("h", []),
+            "l": data.get("l", []),
+            "c": data.get("c", []),
+            "v": data.get("v", []),
+        }
+    )
+
+    if candles.empty:
+        return candles
+
+    candles["t"] = pd.to_datetime(candles["t"], unit="s", errors="coerce")
+    for col in ["o", "h", "l", "c", "v"]:
+        candles[col] = pd.to_numeric(candles[col], errors="coerce")
+
+    return candles
 
 
-def fetch_option_chain(symbol: str, api_key: str) -> pd.DataFrame:
+def fetch_option_chain(symbol: str, api_key: str, min_dte: int = 7, max_dte: int = 45, strike_limit: int = 12) -> pd.DataFrame:
     headers = {"Authorization": f"Bearer {api_key}"}
     url = f"https://api.marketdata.app/v1/options/chain/{symbol.upper()}/"
+
+    today = date.today()
+    from_date = today + timedelta(days=int(min_dte))
+    to_date = today + timedelta(days=int(max_dte))
+
     params = {
         "dateformat": "timestamp",
-        "expiration": "all",
         "nonstandard": "false",
+        "from": from_date.isoformat(),
+        "to": to_date.isoformat(),
+        "strikeLimit": strike_limit,
     }
 
     resp = requests.get(url, headers=headers, params=params, timeout=DEFAULT_API_TIMEOUT)
@@ -425,7 +479,7 @@ def normalize_chain(chain: pd.DataFrame, symbol: Optional[str] = None) -> pd.Dat
     df["mid"] = np.where(
         df["mid"].notna(),
         df["mid"],
-        df.apply(lambda r: option_mid(r["bid"], r["ask"], r["last"]), axis=1)
+        df.apply(lambda r: option_mid(r["bid"], r["ask"], r["last"]), axis=1),
     )
 
     df["spread_pct"] = df.apply(lambda r: pct_bid_ask_spread(r["bid"], r["ask"]), axis=1)
@@ -503,21 +557,14 @@ def scan_single_legs(
     df["extrinsic_dollars"] = df.apply(compute_extrinsic, axis=1).round(2)
     df["approx_itm_prob"] = df.apply(compute_pop, axis=1)
     df["score"] = (df["delta_abs"] / df["premium"].replace(0, np.nan)) * 1000.0
-    df["moneyness"] = np.where(
-        df["option_type"] == "call",
-        (df["strike"] - spot),
-        (spot - df["strike"])
-    )
+    df["moneyness"] = np.where(df["option_type"] == "call", (df["strike"] - spot), (spot - df["strike"]))
 
     cols = [
         "symbol", "expiration", "dte", "option_type", "strike",
         "bid", "ask", "last", "mid", "delta", "delta_abs", "iv", "oi", "volume",
-        "premium", "extrinsic_dollars", "approx_itm_prob", "moneyness", "score"
+        "premium", "extrinsic_dollars", "approx_itm_prob", "moneyness", "score",
     ]
-    df = df[cols].sort_values(
-        ["score", "approx_itm_prob", "volume", "oi"],
-        ascending=[False, False, False, False]
-    ).reset_index(drop=True)
+    df = df[cols].sort_values(["score", "approx_itm_prob", "volume", "oi"], ascending=[False, False, False, False]).reset_index(drop=True)
 
     return df
 
@@ -603,36 +650,38 @@ def build_vertical_spreads_for_expiration(
 
             credit_pct_width = credit / width if width > 0 else np.nan
 
-            rows.append({
-                "symbol": symbol,
-                "expiration": short_row["expiration"],
-                "dte": short_row["dte"],
-                "strategy": strategy,
-                "option_type": option_type,
-                "short_strike": short_strike,
-                "long_strike": long_strike,
-                "width": width,
-                "short_delta": short_row["delta"],
-                "short_delta_abs": short_delta_abs,
-                "short_bid": short_row["bid"],
-                "short_ask": short_row["ask"],
-                "short_mid": short_mid,
-                "long_bid": long_row["bid"],
-                "long_ask": long_row["ask"],
-                "long_mid": long_mid,
-                "credit": round(credit_dollars, 2),
-                "max_risk": round(max_risk, 2),
-                "credit_pct_width": round(credit_pct_width, 4) if np.isfinite(credit_pct_width) else np.nan,
-                "pop": round(pop, 4) if np.isfinite(pop) else np.nan,
-                "ev": round(ev, 2) if np.isfinite(ev) else np.nan,
-                "score": round(score, 4) if np.isfinite(score) else np.nan,
-                "fair_credit_heuristic": round(fair_credit, 2) if np.isfinite(fair_credit) else np.nan,
-                "edge_dollars": round(edge_dollars, 2) if np.isfinite(edge_dollars) else np.nan,
-                "lottery_flag": lottery_flag,
-                "take_profit_dollars": round(take_profit_dollars, 2),
-                "buyback_target_dollars": round(buyback_target_dollars, 2),
-                "roi_on_risk": round(credit_dollars / max_risk, 4),
-            })
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "expiration": short_row["expiration"],
+                    "dte": short_row["dte"],
+                    "strategy": strategy,
+                    "option_type": option_type,
+                    "short_strike": short_strike,
+                    "long_strike": long_strike,
+                    "width": width,
+                    "short_delta": short_row["delta"],
+                    "short_delta_abs": short_delta_abs,
+                    "short_bid": short_row["bid"],
+                    "short_ask": short_row["ask"],
+                    "short_mid": short_mid,
+                    "long_bid": long_row["bid"],
+                    "long_ask": long_row["ask"],
+                    "long_mid": long_mid,
+                    "credit": round(credit_dollars, 2),
+                    "max_risk": round(max_risk, 2),
+                    "credit_pct_width": round(credit_pct_width, 4) if np.isfinite(credit_pct_width) else np.nan,
+                    "pop": round(pop, 4) if np.isfinite(pop) else np.nan,
+                    "ev": round(ev, 2) if np.isfinite(ev) else np.nan,
+                    "score": round(score, 4) if np.isfinite(score) else np.nan,
+                    "fair_credit_heuristic": round(fair_credit, 2) if np.isfinite(fair_credit) else np.nan,
+                    "edge_dollars": round(edge_dollars, 2) if np.isfinite(edge_dollars) else np.nan,
+                    "lottery_flag": lottery_flag,
+                    "take_profit_dollars": round(take_profit_dollars, 2),
+                    "buyback_target_dollars": round(buyback_target_dollars, 2),
+                    "roi_on_risk": round(credit_dollars / max_risk, 4),
+                }
+            )
 
     return pd.DataFrame(rows)
 
@@ -645,8 +694,12 @@ def scan_credit_spreads(
     max_dte: int,
     max_width: float,
     require_liquidity: bool,
+    allowed_strategies: list[str] | None = None,
 ):
     df = chain.copy()
+
+    if allowed_strategies is None:
+        allowed_strategies = ["bull_put", "bear_call"]
 
     max_risk_dollars = account_size * max_risk_pct
     symbols = sorted(df["symbol"].dropna().astype(str).unique().tolist())
@@ -666,30 +719,31 @@ def scan_credit_spreads(
         for exp in expirations:
             df_exp = sym_df[sym_df["expiration"] == exp].copy()
 
-            puts = build_vertical_spreads_for_expiration(
-                df_exp=df_exp,
-                symbol=symbol,
-                option_type="put",
-                strategy="bull_put",
-                max_width=max_width,
-                max_risk_dollars=max_risk_dollars,
-                require_liquidity=require_liquidity,
-            )
+            if "bull_put" in allowed_strategies:
+                puts = build_vertical_spreads_for_expiration(
+                    df_exp=df_exp,
+                    symbol=symbol,
+                    option_type="put",
+                    strategy="bull_put",
+                    max_width=max_width,
+                    max_risk_dollars=max_risk_dollars,
+                    require_liquidity=require_liquidity,
+                )
+                if not puts.empty:
+                    out_parts.append(puts)
 
-            calls = build_vertical_spreads_for_expiration(
-                df_exp=df_exp,
-                symbol=symbol,
-                option_type="call",
-                strategy="bear_call",
-                max_width=max_width,
-                max_risk_dollars=max_risk_dollars,
-                require_liquidity=require_liquidity,
-            )
-
-            if not puts.empty:
-                out_parts.append(puts)
-            if not calls.empty:
-                out_parts.append(calls)
+            if "bear_call" in allowed_strategies:
+                calls = build_vertical_spreads_for_expiration(
+                    df_exp=df_exp,
+                    symbol=symbol,
+                    option_type="call",
+                    strategy="bear_call",
+                    max_width=max_width,
+                    max_risk_dollars=max_risk_dollars,
+                    require_liquidity=require_liquidity,
+                )
+                if not calls.empty:
+                    out_parts.append(calls)
 
     if not out_parts:
         return pd.DataFrame()
@@ -703,11 +757,7 @@ def scan_credit_spreads(
     out["pop_pct"] = (out["pop"] * 100.0).round(1)
     out["roi_pct"] = (out["roi_on_risk"] * 100.0).round(1)
 
-    out = out.sort_values(
-        ["ev", "credit", "score"],
-        ascending=[False, False, False]
-    ).reset_index(drop=True)
-
+    out = out.sort_values(["ev", "credit", "score"], ascending=[False, False, False]).reset_index(drop=True)
     return out
 
 
@@ -719,7 +769,7 @@ def build_debug_view(chain: pd.DataFrame):
         c for c in [
             "symbol", "expiration", "dte", "option_type", "strike",
             "bid", "ask", "last", "mid", "spread_pct", "delta", "delta_abs",
-            "iv", "oi", "volume", "timestamp", "optionSymbol", "underlyingPrice"
+            "iv", "oi", "volume", "timestamp", "optionSymbol", "underlyingPrice",
         ] if c in chain.columns
     ]
     return chain[cols].copy()
@@ -759,12 +809,15 @@ def validate_chain(chain: pd.DataFrame):
 # =========================================================
 # CACHE
 # =========================================================
-@st.cache_data(ttl=60)
-def load_symbol_data(symbol: str, api_key: str):
-    quote = fetch_underlying_quote(symbol, api_key)
-    chain_raw = fetch_option_chain(symbol, api_key)
+@st.cache_data(ttl=300)
+def load_symbol_data(symbol: str, api_key: str, min_dte: int, max_dte: int, strike_limit: int):
+    chain_raw = fetch_option_chain(symbol, api_key, min_dte=min_dte, max_dte=max_dte, strike_limit=strike_limit)
     chain = normalize_chain(chain_raw, symbol=symbol)
-    return quote, chain
+
+    candles = fetch_stock_candles(symbol, api_key, countback=60)
+    trend_info = classify_trend_from_candles(candles)
+
+    return chain, candles, trend_info
 
 
 # =========================================================
@@ -784,25 +837,15 @@ with st.expander("Scanner Settings", expanded=True):
             disabled=True if saved_api_key else False,
         )
         symbol_input = st.text_input("Symbols (comma separated)", value="SPY,QQQ,AMD")
-        account_size = st.number_input(
-            "Account Size",
-            min_value=100.0,
-            value=DEFAULT_ACCOUNT_SIZE,
-            step=50.0,
-        )
-        max_risk_pct = st.slider(
-            "Max Risk Per Trade (% of acct)",
-            0.05,
-            0.40,
-            DEFAULT_MAX_RISK_PCT,
-            0.01,
-        )
+        account_size = st.number_input("Account Size", min_value=100.0, value=DEFAULT_ACCOUNT_SIZE, step=50.0)
+        max_risk_pct = st.slider("Max Risk Per Trade (% of acct)", 0.05, 0.40, DEFAULT_MAX_RISK_PCT, 0.01)
         require_liquidity = st.checkbox("Require Liquidity Filter", value=True)
 
     with c2:
         min_dte = st.number_input("Min DTE", min_value=1, value=DEFAULT_MIN_DTE, step=1)
         max_dte = st.number_input("Max DTE", min_value=1, value=DEFAULT_MAX_DTE, step=1)
         max_width = st.selectbox("Max Spread Width", options=[1.0, 2.0, 3.0, 5.0], index=1)
+        strike_limit = st.selectbox("Strike Limit Near Money", options=[6, 8, 10, 12, 16, 20], index=3)
         single_delta_min = st.slider("Single-Leg Delta Min", 0.05, 0.80, DEFAULT_SINGLE_DELTA_MIN, 0.01)
         single_delta_max = st.slider("Single-Leg Delta Max", 0.05, 0.80, DEFAULT_SINGLE_DELTA_MAX, 0.01)
 
@@ -824,12 +867,20 @@ else:
         if not api_key:
             st.warning("Add MARKETDATA_API_KEY to Streamlit secrets.")
         else:
-            all_quotes = {}
+            all_trends = {}
+            all_candles = {}
             chain_parts = []
 
             for sym in symbols:
-                quote, chain = load_symbol_data(sym, api_key)
-                all_quotes[sym] = quote
+                chain, candles, trend_info = load_symbol_data(
+                    sym,
+                    api_key,
+                    min_dte=min_dte,
+                    max_dte=max_dte,
+                    strike_limit=strike_limit,
+                )
+                all_trends[sym] = trend_info
+                all_candles[sym] = candles
                 if not chain.empty:
                     chain_parts.append(chain)
 
@@ -842,16 +893,20 @@ else:
                 with tabs[0]:
                     st.subheader("Overview")
 
-                    quote_rows = []
+                    trend_rows = []
                     for sym in symbols:
-                        q = all_quotes.get(sym, {})
-                        quote_rows.append({
-                            "symbol": sym,
-                            "spot": q.get("spot"),
-                            "quote_timestamp": q.get("timestamp"),
-                        })
+                        info = all_trends.get(sym, {})
+                        trend_rows.append(
+                            {
+                                "symbol": sym,
+                                "trend": info.get("trend"),
+                                "last_close": info.get("last_close"),
+                                "sma20": info.get("sma20"),
+                                "sma50": info.get("sma50"),
+                            }
+                        )
 
-                    st.dataframe(pd.DataFrame(quote_rows), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(trend_rows), use_container_width=True, hide_index=True)
 
                     if validation_issues:
                         st.warning("Data issues found:")
@@ -862,13 +917,15 @@ else:
 
                     st.write(f"Contracts loaded: **{len(full_chain):,}**")
                     st.write(f"Symbols loaded: **{', '.join(sorted(full_chain['symbol'].unique()))}**")
-
                     st.write("Raw expirations:", sorted(full_chain["expiration"].dropna().astype(str).unique().tolist()))
                     st.write("Option types:", full_chain["option_type"].value_counts(dropna=False).to_dict())
-                    st.write("DTE range:", {
-                        "min": safe_float(full_chain["dte"].min(), np.nan),
-                        "max": safe_float(full_chain["dte"].max(), np.nan),
-                    })
+                    st.write(
+                        "DTE range:",
+                        {
+                            "min": safe_float(full_chain["dte"].min(), np.nan),
+                            "max": safe_float(full_chain["dte"].max(), np.nan),
+                        },
+                    )
 
                 with tabs[1]:
                     st.subheader("Single-Leg Scanner")
@@ -876,14 +933,13 @@ else:
                     single_direction = st.radio("Direction", options=["bullish", "bearish"], horizontal=True)
                     single_symbol = st.selectbox("Symbol", options=symbols, index=0, key="single_symbol")
 
-                    quote = all_quotes.get(single_symbol, {})
                     single_df = full_chain[full_chain["symbol"] == single_symbol].copy()
 
-                    spot = safe_float(quote.get("spot"), np.nan)
+                    spot = np.nan
                     if "underlyingPrice" in single_df.columns:
                         valid_chain_spots = single_df["underlyingPrice"].dropna()
                         if not valid_chain_spots.empty:
-                            spot = safe_float(valid_chain_spots.iloc[0], spot)
+                            spot = safe_float(valid_chain_spots.iloc[0], np.nan)
 
                     if not np.isfinite(spot):
                         st.error(f"No valid spot price for {single_symbol}.")
@@ -911,7 +967,7 @@ else:
                                 "symbol", "expiration", "dte", "option_type", "strike",
                                 "bid", "ask", "last", "mid", "delta", "delta_abs", "iv",
                                 "oi", "volume", "premium", "extrinsic_dollars",
-                                "approx_itm_prob", "moneyness", "score"
+                                "approx_itm_prob", "moneyness", "score",
                             ]
                             st.dataframe(out[show_cols], use_container_width=True, hide_index=True)
 
@@ -932,14 +988,25 @@ Score: **{top['score']:.3f}**
                 with tabs[2]:
                     st.subheader("Credit Spread Scanner")
 
+                    selected_symbol = st.selectbox("Trend Filter Symbol", options=symbols, index=0, key="trend_filter_symbol")
+                    trend_info = all_trends.get(selected_symbol, {})
+                    trend_label = trend_info.get("trend", "Unknown")
+                    allowed = allowed_strategies_from_trend(trend_label)
+
+                    st.write(f"Trend for **{selected_symbol}**: **{trend_label}**")
+                    st.write(f"Spread filter: **{', '.join(allowed)}**")
+
+                    spread_source = full_chain[full_chain["symbol"] == selected_symbol].copy()
+
                     spread_results = scan_credit_spreads(
-                        chain=full_chain,
+                        chain=spread_source,
                         account_size=account_size,
                         max_risk_pct=max_risk_pct,
                         min_dte=min_dte,
                         max_dte=max_dte,
                         max_width=max_width,
                         require_liquidity=require_liquidity,
+                        allowed_strategies=allowed,
                     )
 
                     if spread_results.empty:
@@ -952,7 +1019,7 @@ Score: **{top['score']:.3f}**
                             "symbol", "expiration", "dte", "spread_name",
                             "short_delta", "credit", "credit_pct_width", "max_risk",
                             "pop_pct", "roi_pct", "ev", "score", "edge_dollars",
-                            "take_profit_dollars", "buyback_target_dollars", "lottery_flag"
+                            "take_profit_dollars", "buyback_target_dollars", "lottery_flag",
                         ]
                         st.dataframe(disp[show_cols], use_container_width=True, hide_index=True)
 
@@ -973,7 +1040,7 @@ EV: **${row['ev']:.2f}** | TP: **${row['take_profit_dollars']:.2f}**
                         qty = contracts_allowed(
                             max_risk_per_trade=top["max_risk"],
                             account_size=account_size,
-                            total_risk_cap_pct=DEFAULT_TOTAL_RISK_CAP_PCT
+                            total_risk_cap_pct=DEFAULT_TOTAL_RISK_CAP_PCT,
                         )
 
                         st.markdown("### Top Spread Candidate")
@@ -1012,6 +1079,8 @@ Short Delta: **{top['short_delta']:.3f}**
                     assumed_win_rate = st.slider("Assumed Win Rate", 0.30, 0.95, 0.70, 0.01)
 
                     growth_df_source = full_chain[full_chain["symbol"] == growth_symbol].copy()
+                    growth_trend = all_trends.get(growth_symbol, {}).get("trend", "Unknown")
+                    growth_allowed = allowed_strategies_from_trend(growth_trend)
 
                     growth_spreads = scan_credit_spreads(
                         chain=growth_df_source,
@@ -1021,6 +1090,7 @@ Short Delta: **{top['short_delta']:.3f}**
                         max_dte=max_dte,
                         max_width=max_width,
                         require_liquidity=require_liquidity,
+                        allowed_strategies=growth_allowed,
                     )
 
                     if growth_spreads.empty:
@@ -1051,6 +1121,7 @@ Short Delta: **{top['short_delta']:.3f}**
                         st.write(
                             f"""
 **{model_trade['symbol']} - {model_trade['spread_name']}**  
+Trend Filter: **{growth_trend}**  
 Short Delta: **{model_trade['short_delta']:.3f}**  
 Credit: **${model_trade['credit']:.2f}**  
 Max Risk: **${model_trade['max_risk']:.2f}**  
@@ -1075,9 +1146,8 @@ Assumed Win Rate: **{assumed_win_rate * 100:.1f}%**
                     debug_symbol = st.selectbox("Debug Symbol", options=symbols, index=0, key="debug_symbol")
                     dbg = full_chain[full_chain["symbol"] == debug_symbol].copy()
 
-                    quote = all_quotes.get(debug_symbol, {})
-                    st.write("Underlying Quote")
-                    st.json(quote)
+                    st.write("Trend Info")
+                    st.json(all_trends.get(debug_symbol, {}))
 
                     st.write("Normalized Chain")
                     st.dataframe(build_debug_view(dbg), use_container_width=True, hide_index=True)
@@ -1093,11 +1163,23 @@ Assumed Win Rate: **{assumed_win_rate * 100:.1f}%**
                     missing_mid = dbg[dbg["mid"].isna()]
                     st.write(f"Rows missing usable price: **{len(missing_mid)}**")
 
+                    st.markdown("### Chain Summary")
+                    st.write("Row count:", len(dbg))
+                    st.write("Expirations:", sorted(dbg["expiration"].dropna().astype(str).unique().tolist()))
+                    st.write("Option types:", dbg["option_type"].value_counts(dropna=False).to_dict())
+                    st.write(
+                        "DTE range:",
+                        {
+                            "min": safe_float(dbg["dte"].min(), np.nan),
+                            "max": safe_float(dbg["dte"].max(), np.nan),
+                        },
+                    )
+
                     st.markdown("### Why prices can look off")
                     st.write(
                         """
 - using `last` instead of `mid`
-- stale option chain vs fresh underlying quote
+- stale or delayed chain data
 - mixing expirations
 - bad leg pairing
 - delta sign issues on puts
