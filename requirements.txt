@@ -1,7 +1,4 @@
 streamlit
-yfinance
 pandas
 numpy
-scipy
-matplotlib
-requests
+yfinance
