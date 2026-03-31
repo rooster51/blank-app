@@ -1040,7 +1040,6 @@ else:
                         scores = spread_results.apply(lambda r: pd.Series(rate_trade(r, trend, zones)), axis=1)
                         spread_results = pd.concat([spread_results, scores], axis=1)
 
-                        # diagnostics
                         diagnostic = {}
                         if trend == "Downtrend":
                             diagnostic["needed_short_call_above"] = (
@@ -1049,7 +1048,9 @@ else:
                                 else np.nan
                             )
                             if not chain[chain["option_type"] == "call"].empty:
-                                diagnostic["highest_call_strike_returned"] = safe_float(chain[chain["option_type"] == "call"]["strike"].max(), np.nan)
+                                diagnostic["highest_call_strike_returned"] = safe_float(
+                                    chain[chain["option_type"] == "call"]["strike"].max(), np.nan
+                                )
                         elif trend == "Uptrend":
                             diagnostic["needed_short_put_below"] = (
                                 round(safe_float(zones.get("demand_low"), np.nan) - safe_float(zones.get("atr14"), 0) * atr_zone_buffer, 2)
@@ -1057,7 +1058,9 @@ else:
                                 else np.nan
                             )
                             if not chain[chain["option_type"] == "put"].empty:
-                                diagnostic["lowest_put_strike_returned"] = safe_float(chain[chain["option_type"] == "put"]["strike"].min(), np.nan)
+                                diagnostic["lowest_put_strike_returned"] = safe_float(
+                                    chain[chain["option_type"] == "put"]["strike"].min(), np.nan
+                                )
 
                         st.write("Spread diagnostics:", diagnostic)
 
@@ -1222,3 +1225,6 @@ Trade Score: **{model_trade['trade_score']}**
                             "max": safe_float(chain["dte"].max(), np.nan),
                         },
                     )
+
+    except Exception as e:
+        st.exception(e)
