@@ -1,11 +1,8 @@
-import math
-from datetime import date
-from typing import Optional
-
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+from datetime import date
 
 
 # =========================================================
@@ -13,7 +10,7 @@ import yfinance as yf
 # =========================================================
 st.set_page_config(page_title="Zone-Based Spread App", layout="wide")
 st.title("Zone-Based Spread App")
-st.caption("Trend + support/resistance + nearest spread suggestion. No sidebar.")
+st.caption("Trend + support/resistance + nearest spread suggestion. Manual chain refresh. No sidebar.")
 
 
 # =========================================================
@@ -25,7 +22,6 @@ DEFAULT_TOTAL_RISK_CAP_PCT = 0.50
 DEFAULT_MIN_DTE = 14
 DEFAULT_MAX_DTE = 35
 DEFAULT_MAX_WIDTH = 1.0
-DEFAULT_TAKE_PROFIT_PCT = 0.50
 DEFAULT_MIN_OI = 25
 DEFAULT_MIN_VOL = 1
 DEFAULT_MAX_BID_ASK_PCT = 0.25
@@ -87,6 +83,15 @@ def pct_bid_ask_spread(bid, ask):
     return np.nan
 
 
+def liquidity_ok(row, max_bid_ask_pct=DEFAULT_MAX_BID_ASK_PCT, min_oi=DEFAULT_MIN_OI, min_volume=DEFAULT_MIN_VOL):
+    oi_ok = safe_float(row.get("oi"), 0) >= min_oi
+    vol_ok = safe_float(row.get("volume"), 0) >= min_volume
+    ba = row.get("spread_pct", np.nan)
+    ba_ok = np.isnan(ba) or ba <= max_bid_ask_pct
+    mid_ok = np.isfinite(row.get("mid", np.nan)) and row.get("mid", np.nan) > 0
+    return oi_ok and vol_ok and ba_ok and mid_ok
+
+
 def contracts_allowed(max_risk_per_trade, account_size, total_risk_cap_pct=DEFAULT_TOTAL_RISK_CAP_PCT):
     max_risk_per_trade = safe_float(max_risk_per_trade, np.nan)
     account_size = safe_float(account_size, np.nan)
@@ -127,18 +132,10 @@ def price_location_vs_zones(price: float, zones: dict) -> str:
     return "Outside Zones"
 
 
-def liquidity_ok(row, max_bid_ask_pct=DEFAULT_MAX_BID_ASK_PCT, min_oi=DEFAULT_MIN_OI, min_volume=DEFAULT_MIN_VOL):
-    oi_ok = safe_float(row.get("oi"), 0) >= min_oi
-    vol_ok = safe_float(row.get("volume"), 0) >= min_volume
-    ba = row.get("spread_pct", np.nan)
-    ba_ok = np.isnan(ba) or ba <= max_bid_ask_pct
-    mid_ok = np.isfinite(row.get("mid", np.nan)) and row.get("mid", np.nan) > 0
-    return oi_ok and vol_ok and ba_ok and mid_ok
-
-
 # =========================================================
 # YFINANCE DATA
 # =========================================================
+@st.cache_data(ttl=1800)
 def fetch_stock_candles(symbol: str, period: str = DEFAULT_HISTORY_PERIOD) -> pd.DataFrame:
     ticker = yf.Ticker(symbol)
     hist = ticker.history(period=period, auto_adjust=False)
@@ -172,6 +169,23 @@ def fetch_stock_candles(symbol: str, period: str = DEFAULT_HISTORY_PERIOD) -> pd
     return df[needed].sort_values("t").reset_index(drop=True)
 
 
+@st.cache_data(ttl=1800)
+def get_filtered_expirations(symbol: str, min_dte: int, max_dte: int) -> list[str]:
+    ticker = yf.Ticker(symbol)
+    expirations = list(ticker.options or [])
+    if not expirations:
+        return []
+
+    filtered = []
+    for exp in expirations:
+        dte = calc_dte(exp)
+        if np.isfinite(dte) and min_dte <= dte <= max_dte:
+            filtered.append(exp)
+
+    return filtered
+
+
+@st.cache_data(ttl=900)
 def fetch_option_chain_for_expiration(symbol: str, expiration: str) -> pd.DataFrame:
     ticker = yf.Ticker(symbol)
     chain = ticker.option_chain(expiration)
@@ -251,21 +265,6 @@ def fetch_option_chain_for_expiration(symbol: str, expiration: str) -> pd.DataFr
             df[col] = np.nan
 
     return df[keep_cols].sort_values(["option_type", "strike"]).reset_index(drop=True)
-
-
-def get_filtered_expirations(symbol: str, min_dte: int, max_dte: int) -> list[str]:
-    ticker = yf.Ticker(symbol)
-    expirations = list(ticker.options or [])
-    if not expirations:
-        return []
-
-    filtered = []
-    for exp in expirations:
-        dte = calc_dte(exp)
-        if np.isfinite(dte) and min_dte <= dte <= max_dte:
-            filtered.append(exp)
-
-    return filtered
 
 
 # =========================================================
@@ -627,24 +626,14 @@ def find_backup_zone_strikes(
 # =========================================================
 # CACHE LOADER
 # =========================================================
-@st.cache_data(ttl=300)
-def load_symbol_data(symbol: str, min_dte: int, max_dte: int, selected_expiration: Optional[str] = None):
+@st.cache_data(ttl=1800)
+def load_dashboard_symbol(symbol: str):
     candles_raw = fetch_stock_candles(symbol, period=DEFAULT_HISTORY_PERIOD)
     candles = add_indicators(candles_raw)
     trend_info = classify_trend(candles)
     zones = detect_supply_demand_zones(candles)
-    expirations = get_filtered_expirations(symbol, min_dte=min_dte, max_dte=max_dte)
-
-    chosen_expiration = selected_expiration
-    if not chosen_expiration and expirations:
-        chosen_expiration = expirations[0]
-
-    if chosen_expiration:
-        chain = fetch_option_chain_for_expiration(symbol, chosen_expiration)
-    else:
-        chain = pd.DataFrame()
-
-    return candles, trend_info, zones, expirations, chosen_expiration, chain
+    expirations = get_filtered_expirations(symbol, min_dte=DEFAULT_MIN_DTE, max_dte=DEFAULT_MAX_DTE)
+    return candles, trend_info, zones, expirations
 
 
 # =========================================================
@@ -667,6 +656,16 @@ with st.expander("Scanner Settings", expanded=True):
 
 run_scan = st.button("Load Data / Scan", use_container_width=True)
 
+# session state for selected chain reuse
+if "selected_symbol_chain" not in st.session_state:
+    st.session_state.selected_symbol_chain = pd.DataFrame()
+if "selected_symbol_chain_symbol" not in st.session_state:
+    st.session_state.selected_symbol_chain_symbol = None
+if "selected_symbol_chain_expiration" not in st.session_state:
+    st.session_state.selected_symbol_chain_expiration = None
+if "selected_chain_loaded" not in st.session_state:
+    st.session_state.selected_chain_loaded = False
+
 
 # =========================================================
 # MAIN
@@ -683,22 +682,14 @@ else:
         all_trends = {}
         all_zones = {}
         all_expirations = {}
-        all_selected_expirations = {}
-        all_chains = {}
 
         for sym in symbols:
-            candles, trend_info, zones, expirations, chosen_expiration, chain = load_symbol_data(
-                sym,
-                min_dte=min_dte,
-                max_dte=max_dte,
-                selected_expiration=None,
-            )
+            candles, trend_info, zones, expirations = load_dashboard_symbol(sym)
+            expirations = [e for e in expirations if np.isfinite(calc_dte(e)) and min_dte <= calc_dte(e) <= max_dte]
             all_candles[sym] = candles
             all_trends[sym] = trend_info
             all_zones[sym] = zones
             all_expirations[sym] = expirations
-            all_selected_expirations[sym] = chosen_expiration
-            all_chains[sym] = chain
 
         # DASHBOARD
         with tabs[0]:
@@ -764,18 +755,6 @@ else:
             zones = all_zones.get(spread_symbol, {})
             expirations = all_expirations.get(spread_symbol, [])
 
-            if expirations:
-                selected_expiration = st.selectbox(
-                    "Expiration",
-                    options=expirations,
-                    index=0,
-                    key="selected_expiration",
-                )
-                chain = fetch_option_chain_for_expiration(spread_symbol, selected_expiration)
-            else:
-                selected_expiration = None
-                chain = pd.DataFrame()
-
             trend = trend_info.get("trend", "Unknown")
             strength = trend_info.get("strength", "Unknown")
             price = safe_float(trend_info.get("last_close"), np.nan)
@@ -785,65 +764,106 @@ else:
             st.write(f"**Demand / Support Zone:** {zones.get('demand_low')} to {zones.get('demand_high')}")
             st.write(f"**Supply / Resistance Zone:** {zones.get('supply_low')} to {zones.get('supply_high')}")
 
-            if chain.empty:
-                st.info("No option chain returned for the selected expiration.")
+            if not expirations:
+                st.info("No expirations found in the selected DTE range.")
             else:
-                suggestion = find_nearest_zone_based_spread(
-                    chain=chain,
-                    trend=trend,
-                    zones=zones,
-                    width=max_width,
-                    atr_buffer_mult=atr_zone_buffer,
-                    require_liquidity=require_liquidity,
+                selected_expiration = st.selectbox(
+                    "Expiration",
+                    options=expirations,
+                    index=0,
+                    key="selected_expiration",
                 )
 
-                backups = find_backup_zone_strikes(
-                    chain=chain,
-                    trend=trend,
-                    zones=zones,
-                    atr_buffer_mult=atr_zone_buffer,
-                    require_liquidity=require_liquidity,
-                    limit=5,
-                )
+                c_refresh, c_clear = st.columns(2)
+                with c_refresh:
+                    refresh_chain = st.button("Refresh Selected Chain", use_container_width=True)
+                with c_clear:
+                    clear_chain = st.button("Clear Cached Chain", use_container_width=True)
 
-                diagnostics = {}
-                atr14 = safe_float(zones.get("atr14"), np.nan)
+                if clear_chain:
+                    st.session_state.selected_symbol_chain = pd.DataFrame()
+                    st.session_state.selected_symbol_chain_symbol = None
+                    st.session_state.selected_symbol_chain_expiration = None
+                    st.session_state.selected_chain_loaded = False
 
-                if trend == "Uptrend":
-                    demand_low = safe_float(zones.get("demand_low"), np.nan)
-                    if np.isfinite(demand_low) and np.isfinite(atr14):
-                        diagnostics["target_short_below"] = round(demand_low - (atr14 * atr_zone_buffer), 2)
-                    put_chain = chain[chain["option_type"] == "put"]
-                    if not put_chain.empty:
-                        diagnostics["lowest_put_returned"] = safe_float(put_chain["strike"].min(), np.nan)
-                        diagnostics["highest_put_returned"] = safe_float(put_chain["strike"].max(), np.nan)
+                symbol_changed = st.session_state.selected_symbol_chain_symbol != spread_symbol
+                expiration_changed = st.session_state.selected_symbol_chain_expiration != selected_expiration
+                needs_first_load = not st.session_state.selected_chain_loaded
 
-                elif trend == "Downtrend":
-                    supply_high = safe_float(zones.get("supply_high"), np.nan)
-                    if np.isfinite(supply_high) and np.isfinite(atr14):
-                        diagnostics["target_short_above"] = round(supply_high + (atr14 * atr_zone_buffer), 2)
-                    call_chain = chain[chain["option_type"] == "call"]
-                    if not call_chain.empty:
-                        diagnostics["lowest_call_returned"] = safe_float(call_chain["strike"].min(), np.nan)
-                        diagnostics["highest_call_returned"] = safe_float(call_chain["strike"].max(), np.nan)
-
-                st.write("Diagnostics:", diagnostics)
-
-                if suggestion is None:
-                    st.info("No valid zone-based spread suggestion found.")
+                if refresh_chain or symbol_changed or expiration_changed or needs_first_load:
+                    with st.spinner("Loading selected option chain..."):
+                        chain = fetch_option_chain_for_expiration(spread_symbol, selected_expiration)
+                    st.session_state.selected_symbol_chain = chain
+                    st.session_state.selected_symbol_chain_symbol = spread_symbol
+                    st.session_state.selected_symbol_chain_expiration = selected_expiration
+                    st.session_state.selected_chain_loaded = True
                 else:
-                    if pd.isna(suggestion["short_strike"]):
-                        st.warning(suggestion["reason"])
-                    else:
-                        qty = contracts_allowed(
-                            max_risk_per_trade=suggestion["max_risk"],
-                            account_size=account_size,
-                            total_risk_cap_pct=DEFAULT_TOTAL_RISK_CAP_PCT,
-                        )
+                    chain = st.session_state.selected_symbol_chain.copy()
 
-                        st.markdown("### Main Suggestion")
-                        st.write(
-                            f"""
+                if chain.empty:
+                    st.info("No option chain returned for the selected expiration.")
+                else:
+                    st.caption(
+                        f"Using cached chain for {st.session_state.selected_symbol_chain_symbol} "
+                        f"{st.session_state.selected_symbol_chain_expiration}"
+                    )
+
+                    suggestion = find_nearest_zone_based_spread(
+                        chain=chain,
+                        trend=trend,
+                        zones=zones,
+                        width=max_width,
+                        atr_buffer_mult=atr_zone_buffer,
+                        require_liquidity=require_liquidity,
+                    )
+
+                    backups = find_backup_zone_strikes(
+                        chain=chain,
+                        trend=trend,
+                        zones=zones,
+                        atr_buffer_mult=atr_zone_buffer,
+                        require_liquidity=require_liquidity,
+                        limit=5,
+                    )
+
+                    diagnostics = {}
+                    atr14 = safe_float(zones.get("atr14"), np.nan)
+
+                    if trend == "Uptrend":
+                        demand_low = safe_float(zones.get("demand_low"), np.nan)
+                        if np.isfinite(demand_low) and np.isfinite(atr14):
+                            diagnostics["target_short_below"] = round(demand_low - (atr14 * atr_zone_buffer), 2)
+                        put_chain = chain[chain["option_type"] == "put"]
+                        if not put_chain.empty:
+                            diagnostics["lowest_put_returned"] = safe_float(put_chain["strike"].min(), np.nan)
+                            diagnostics["highest_put_returned"] = safe_float(put_chain["strike"].max(), np.nan)
+
+                    elif trend == "Downtrend":
+                        supply_high = safe_float(zones.get("supply_high"), np.nan)
+                        if np.isfinite(supply_high) and np.isfinite(atr14):
+                            diagnostics["target_short_above"] = round(supply_high + (atr14 * atr_zone_buffer), 2)
+                        call_chain = chain[chain["option_type"] == "call"]
+                        if not call_chain.empty:
+                            diagnostics["lowest_call_returned"] = safe_float(call_chain["strike"].min(), np.nan)
+                            diagnostics["highest_call_returned"] = safe_float(call_chain["strike"].max(), np.nan)
+
+                    st.write("Diagnostics:", diagnostics)
+
+                    if suggestion is None:
+                        st.info("No valid zone-based spread suggestion found.")
+                    else:
+                        if pd.isna(suggestion["short_strike"]):
+                            st.warning(suggestion["reason"])
+                        else:
+                            qty = contracts_allowed(
+                                max_risk_per_trade=suggestion["max_risk"],
+                                account_size=account_size,
+                                total_risk_cap_pct=DEFAULT_TOTAL_RISK_CAP_PCT,
+                            )
+
+                            st.markdown("### Main Suggestion")
+                            st.write(
+                                f"""
 **Strategy:** {suggestion['strategy']}  
 **Zone Type:** {suggestion['zone_type']}  
 **Zone:** {suggestion['zone_low']} to {suggestion['zone_high']}  
@@ -858,13 +878,13 @@ else:
 **Reason:** {suggestion['reason']}  
 **Contracts Allowed:** {qty}
 """
-                        )
+                            )
 
-                st.markdown("### Backup Short Strikes to Look At")
-                if backups.empty:
-                    st.info("No backup strikes found.")
-                else:
-                    st.dataframe(backups, use_container_width=True, hide_index=True)
+                    st.markdown("### Backup Short Strikes to Look At")
+                    if backups.empty:
+                        st.info("No backup strikes found.")
+                    else:
+                        st.dataframe(backups, use_container_width=True, hide_index=True)
 
         # GROWTH
         with tabs[2]:
@@ -876,18 +896,17 @@ else:
 
             trend_info = all_trends.get(growth_symbol, {})
             zones = all_zones.get(growth_symbol, {})
-            expirations = all_expirations.get(growth_symbol, [])
-
-            if expirations:
-                growth_exp = expirations[0]
-                chain = fetch_option_chain_for_expiration(growth_symbol, growth_exp)
-            else:
-                chain = pd.DataFrame()
-
             trend = trend_info.get("trend", "Unknown")
 
+            growth_chain = pd.DataFrame()
+            if (
+                st.session_state.selected_chain_loaded
+                and st.session_state.selected_symbol_chain_symbol == growth_symbol
+            ):
+                growth_chain = st.session_state.selected_symbol_chain.copy()
+
             suggestion = find_nearest_zone_based_spread(
-                chain=chain,
+                chain=growth_chain,
                 trend=trend,
                 zones=zones,
                 width=max_width,
@@ -896,7 +915,7 @@ else:
             )
 
             if suggestion is None or pd.isna(suggestion.get("credit")) or pd.isna(suggestion.get("max_risk")):
-                st.info("No usable spread available for growth projection.")
+                st.info("Select this ticker and load its chain in Suggested Spread first.")
             else:
                 fixed_df = project_growth_fixed(
                     start_balance=account_size,
@@ -944,14 +963,22 @@ Max Risk: **${suggestion['max_risk']:.2f}**
             expirations = all_expirations.get(debug_symbol, [])
             st.write("Filtered expirations:", expirations)
 
-            if expirations:
-                debug_exp = st.selectbox("Debug Expiration", options=expirations, index=0, key="debug_exp")
-                chain = fetch_option_chain_for_expiration(debug_symbol, debug_exp)
+            if (
+                st.session_state.selected_chain_loaded
+                and st.session_state.selected_symbol_chain_symbol == debug_symbol
+                and not st.session_state.selected_symbol_chain.empty
+            ):
+                chain = st.session_state.selected_symbol_chain.copy()
+                st.write(
+                    f"Using cached chain for {st.session_state.selected_symbol_chain_symbol} "
+                    f"{st.session_state.selected_symbol_chain_expiration}"
+                )
             else:
                 chain = pd.DataFrame()
+                st.write("No cached chain for this symbol yet. Load it in Suggested Spread first.")
 
             if chain.empty:
-                st.info("No chain data.")
+                st.info("No cached chain data.")
             else:
                 debug_cols = [
                     c for c in [
