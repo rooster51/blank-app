@@ -11,9 +11,9 @@ import streamlit as st
 # =========================================================
 # PAGE CONFIG
 # =========================================================
-st.set_page_config(page_title="Trend + Zone Spread App", layout="wide")
-st.title("Trend + Zone Spread App")
-st.caption("Trend-first spread suggestions using supply/demand zones. No sidebar.")
+st.set_page_config(page_title="Zone-Based Spread App", layout="wide")
+st.title("Zone-Based Spread App")
+st.caption("Trend + support/resistance + nearest spread suggestion. No sidebar.")
 
 
 # =========================================================
@@ -88,26 +88,6 @@ def pct_bid_ask_spread(bid, ask):
     return np.nan
 
 
-def approx_pop_from_short_delta(delta_abs: float) -> float:
-    if not np.isfinite(delta_abs):
-        return np.nan
-    return max(0.0, min(1.0, 1.0 - abs(delta_abs)))
-
-
-def expected_value(credit_dollars, max_risk_dollars, pop):
-    if not all(np.isfinite(v) for v in [credit_dollars, max_risk_dollars, pop]):
-        return np.nan
-    return (pop * credit_dollars) - ((1.0 - pop) * max_risk_dollars)
-
-
-def spread_score(credit_dollars, max_risk_dollars, pop):
-    if not all(np.isfinite(v) for v in [credit_dollars, max_risk_dollars, pop]):
-        return np.nan
-    if max_risk_dollars <= 0:
-        return np.nan
-    return (credit_dollars / max_risk_dollars) * pop
-
-
 def contracts_allowed(max_risk_per_trade, account_size, total_risk_cap_pct=DEFAULT_TOTAL_RISK_CAP_PCT):
     max_risk_per_trade = safe_float(max_risk_per_trade, np.nan)
     account_size = safe_float(account_size, np.nan)
@@ -139,23 +119,16 @@ def payload_to_frame(payload: dict) -> pd.DataFrame:
     return pd.DataFrame(normalized)
 
 
-def project_growth_fixed(start_balance: float, avg_win: float, avg_loss: float, win_rate: float, num_trades: int):
-    balance = safe_float(start_balance, 0.0)
-    win_rate = safe_float(win_rate, 0.0)
-
-    history = []
-    for i in range(1, num_trades + 1):
-        expected_trade_pl = (win_rate * avg_win) - ((1.0 - win_rate) * avg_loss)
-        balance += expected_trade_pl
-        history.append(
-            {
-                "trade_num": i,
-                "expected_balance": round(balance, 2),
-                "expected_trade_pl": round(expected_trade_pl, 2),
-            }
-        )
-
-    return pd.DataFrame(history)
+def nearest_by_difference(values: pd.Series, target: float, above: bool) -> pd.Series:
+    if above:
+        candidates = values[values > target]
+        if candidates.empty:
+            return candidates
+        return candidates.sort_values(ascending=True)
+    candidates = values[values < target]
+    if candidates.empty:
+        return candidates
+    return candidates.sort_values(ascending=False)
 
 
 def price_location_vs_zones(price: float, zones: dict) -> str:
@@ -169,6 +142,33 @@ def price_location_vs_zones(price: float, zones: dict) -> str:
     if np.isfinite(supply_low) and np.isfinite(supply_high) and supply_low <= price <= supply_high:
         return "Inside Supply"
     return "Outside Zones"
+
+
+def liquidity_ok(row, max_bid_ask_pct=DEFAULT_MAX_BID_ASK_PCT, min_oi=DEFAULT_MIN_OI, min_volume=DEFAULT_MIN_VOL):
+    oi_ok = safe_float(row.get("oi"), 0) >= min_oi
+    vol_ok = safe_float(row.get("volume"), 0) >= min_volume
+    ba = row.get("spread_pct", np.nan)
+    ba_ok = np.isnan(ba) or ba <= max_bid_ask_pct
+    mid_ok = np.isfinite(row.get("mid", np.nan)) and row.get("mid", np.nan) > 0
+    return oi_ok and vol_ok and ba_ok and mid_ok
+
+
+def project_growth_fixed(start_balance: float, avg_win: float, avg_loss: float, win_rate: float, num_trades: int):
+    balance = safe_float(start_balance, 0.0)
+    win_rate = safe_float(win_rate, 0.0)
+
+    rows = []
+    for i in range(1, num_trades + 1):
+        expected_trade_pl = (win_rate * avg_win) - ((1.0 - win_rate) * avg_loss)
+        balance += expected_trade_pl
+        rows.append(
+            {
+                "trade_num": i,
+                "expected_trade_pl": round(expected_trade_pl, 2),
+                "expected_balance": round(balance, 2),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 # =========================================================
@@ -199,7 +199,6 @@ def fetch_stock_candles(symbol: str, api_key: str, countback: int = 120) -> pd.D
             "v": data.get("v", []),
         }
     )
-
     if candles.empty:
         return candles
 
@@ -337,7 +336,6 @@ def normalize_chain(chain: pd.DataFrame, symbol: Optional[str] = None) -> pd.Dat
         "optionSymbol": None,
         "underlyingPrice": np.nan,
     }
-
     for col, default in needed.items():
         if col not in df.columns:
             df[col] = default
@@ -370,17 +368,8 @@ def normalize_chain(chain: pd.DataFrame, symbol: Optional[str] = None) -> pd.Dat
     return df.sort_values(["symbol", "expiration_dt", "option_type", "strike"]).reset_index(drop=True)
 
 
-def liquidity_ok(row, max_bid_ask_pct=DEFAULT_MAX_BID_ASK_PCT, min_oi=DEFAULT_MIN_OI, min_volume=DEFAULT_MIN_VOL):
-    oi_ok = safe_float(row.get("oi"), 0) >= min_oi
-    vol_ok = safe_float(row.get("volume"), 0) >= min_volume
-    ba = row.get("spread_pct", np.nan)
-    ba_ok = np.isnan(ba) or ba <= max_bid_ask_pct
-    mid_ok = np.isfinite(row.get("mid", np.nan)) and row.get("mid", np.nan) > 0
-    return oi_ok and vol_ok and ba_ok and mid_ok
-
-
 # =========================================================
-# PHASE 1 - TREND + ZONES
+# TREND + ZONES
 # =========================================================
 def add_indicators(candles: pd.DataFrame) -> pd.DataFrame:
     if candles.empty:
@@ -463,7 +452,6 @@ def find_pivots(df: pd.DataFrame, left: int = 3, right: int = 3) -> pd.DataFrame
 
         if highs[i] == np.max(high_window):
             rows.append({"idx": i, "type": "high", "price": highs[i], "time": df.iloc[i]["t"]})
-
         if lows[i] == np.min(low_window):
             rows.append({"idx": i, "type": "low", "price": lows[i], "time": df.iloc[i]["t"]})
 
@@ -505,11 +493,9 @@ def detect_supply_demand_zones(df: pd.DataFrame) -> dict:
         pivot_price = safe_float(row["price"], np.nan)
         if not np.isfinite(pivot_price):
             continue
-
         future_slice = df.iloc[idx + 1 : min(idx + 11, len(df))]
         if future_slice.empty:
             continue
-
         rally = safe_float(future_slice["h"].max(), np.nan) - pivot_price
         if np.isfinite(rally) and rally >= atr14 * 1.5:
             demand_low = pivot_price - (atr14 * 0.20)
@@ -522,11 +508,9 @@ def detect_supply_demand_zones(df: pd.DataFrame) -> dict:
         pivot_price = safe_float(row["price"], np.nan)
         if not np.isfinite(pivot_price):
             continue
-
         future_slice = df.iloc[idx + 1 : min(idx + 11, len(df))]
         if future_slice.empty:
             continue
-
         drop = pivot_price - safe_float(future_slice["l"].min(), np.nan)
         if np.isfinite(drop) and drop >= atr14 * 1.5:
             supply_low = pivot_price - (atr14 * 0.35)
@@ -543,319 +527,216 @@ def detect_supply_demand_zones(df: pd.DataFrame) -> dict:
 
 
 # =========================================================
-# PHASE 2 - SPREAD SUGGESTIONS
+# SUGGESTED STRIKE LOGIC
 # =========================================================
-def trend_allowed_strategies(trend: str) -> list[str]:
+def find_nearest_zone_based_spread(
+    chain: pd.DataFrame,
+    trend: str,
+    zones: dict,
+    width: float = 1.0,
+    atr_buffer_mult: float = 0.25,
+    require_liquidity: bool = False,
+):
+    if chain.empty:
+        return None
+
+    df = chain.copy()
+    if require_liquidity:
+        df = df[df.apply(liquidity_ok, axis=1)].copy()
+
+    if df.empty:
+        return None
+
+    atr14 = safe_float(zones.get("atr14"), np.nan)
+    demand_low = safe_float(zones.get("demand_low"), np.nan)
+    demand_high = safe_float(zones.get("demand_high"), np.nan)
+    supply_low = safe_float(zones.get("supply_low"), np.nan)
+    supply_high = safe_float(zones.get("supply_high"), np.nan)
+
     if trend == "Uptrend":
-        return ["bull_put"]
+        if not (np.isfinite(demand_low) and np.isfinite(atr14)):
+            return None
+
+        target_short = demand_low - (atr14 * atr_buffer_mult)
+
+        puts = df[df["option_type"] == "put"].copy().sort_values("strike", ascending=False)
+        if puts.empty:
+            return None
+
+        short_candidates = puts[puts["strike"] < target_short].copy()
+        if short_candidates.empty:
+            return {
+                "strategy": "Bull Put",
+                "zone_type": "Support / Demand",
+                "zone_low": demand_low,
+                "zone_high": demand_high,
+                "target_short_strike": round(target_short, 2),
+                "short_strike": np.nan,
+                "long_strike": np.nan,
+                "short_delta": np.nan,
+                "credit": np.nan,
+                "max_risk": np.nan,
+                "expiration": None,
+                "dte": np.nan,
+                "reason": "No listed put short strike below support buffer.",
+            }
+
+        short_row = short_candidates.iloc[0]
+        short_strike = safe_float(short_row["strike"], np.nan)
+
+        long_candidates = puts[puts["strike"] < short_strike].copy().sort_values("strike", ascending=False)
+        if long_candidates.empty:
+            return None
+
+        # nearest lower strike by default
+        long_row = long_candidates.iloc[0]
+        long_strike = safe_float(long_row["strike"], np.nan)
+
+        if abs(short_strike - long_strike) > width:
+            exact = long_candidates[np.isclose(short_strike - long_candidates["strike"], width)]
+            if not exact.empty:
+                long_row = exact.iloc[0]
+                long_strike = safe_float(long_row["strike"], np.nan)
+            else:
+                return None
+
+        short_mid = safe_float(short_row["mid"], np.nan)
+        long_mid = safe_float(long_row["mid"], np.nan)
+        if not np.isfinite(short_mid) or not np.isfinite(long_mid):
+            return None
+
+        credit = (short_mid - long_mid) * 100.0
+        max_risk = (abs(short_strike - long_strike) - (short_mid - long_mid)) * 100.0
+
+        return {
+            "strategy": "Bull Put",
+            "zone_type": "Support / Demand",
+            "zone_low": demand_low,
+            "zone_high": demand_high,
+            "target_short_strike": round(target_short, 2),
+            "short_strike": short_strike,
+            "long_strike": long_strike,
+            "short_delta": safe_float(short_row.get("delta"), np.nan),
+            "credit": round(credit, 2),
+            "max_risk": round(max_risk, 2),
+            "expiration": short_row.get("expiration"),
+            "dte": short_row.get("dte"),
+            "reason": "Nearest listed put short strike below support buffer.",
+        }
+
     if trend == "Downtrend":
-        return ["bear_call"]
-    return []
+        if not (np.isfinite(supply_high) and np.isfinite(atr14)):
+            return None
+
+        target_short = supply_high + (atr14 * atr_buffer_mult)
+
+        calls = df[df["option_type"] == "call"].copy().sort_values("strike", ascending=True)
+        if calls.empty:
+            return None
+
+        short_candidates = calls[calls["strike"] > target_short].copy()
+        if short_candidates.empty:
+            return {
+                "strategy": "Bear Call",
+                "zone_type": "Resistance / Supply",
+                "zone_low": supply_low,
+                "zone_high": supply_high,
+                "target_short_strike": round(target_short, 2),
+                "short_strike": np.nan,
+                "long_strike": np.nan,
+                "short_delta": np.nan,
+                "credit": np.nan,
+                "max_risk": np.nan,
+                "expiration": None,
+                "dte": np.nan,
+                "reason": "No listed call short strike above resistance buffer.",
+            }
+
+        short_row = short_candidates.iloc[0]
+        short_strike = safe_float(short_row["strike"], np.nan)
+
+        long_candidates = calls[calls["strike"] > short_strike].copy().sort_values("strike", ascending=True)
+        if long_candidates.empty:
+            return None
+
+        long_row = long_candidates.iloc[0]
+        long_strike = safe_float(long_row["strike"], np.nan)
+
+        if abs(short_strike - long_strike) > width:
+            exact = long_candidates[np.isclose(long_candidates["strike"] - short_strike, width)]
+            if not exact.empty:
+                long_row = exact.iloc[0]
+                long_strike = safe_float(long_row["strike"], np.nan)
+            else:
+                return None
+
+        short_mid = safe_float(short_row["mid"], np.nan)
+        long_mid = safe_float(long_row["mid"], np.nan)
+        if not np.isfinite(short_mid) or not np.isfinite(long_mid):
+            return None
+
+        credit = (short_mid - long_mid) * 100.0
+        max_risk = (abs(short_strike - long_strike) - (short_mid - long_mid)) * 100.0
+
+        return {
+            "strategy": "Bear Call",
+            "zone_type": "Resistance / Supply",
+            "zone_low": supply_low,
+            "zone_high": supply_high,
+            "target_short_strike": round(target_short, 2),
+            "short_strike": short_strike,
+            "long_strike": long_strike,
+            "short_delta": safe_float(short_row.get("delta"), np.nan),
+            "credit": round(credit, 2),
+            "max_risk": round(max_risk, 2),
+            "expiration": short_row.get("expiration"),
+            "dte": short_row.get("dte"),
+            "reason": "Nearest listed call short strike above resistance buffer.",
+        }
+
+    return None
 
 
-def build_zone_spreads_for_expiration(
-    df_exp: pd.DataFrame,
-    symbol: str,
-    option_type: str,
-    strategy: str,
-    max_width: float,
-    max_risk_dollars: float,
-    require_liquidity: bool,
+def find_backup_zone_strikes(
+    chain: pd.DataFrame,
+    trend: str,
     zones: dict,
     atr_buffer_mult: float,
+    require_liquidity: bool = False,
+    limit: int = 5,
 ):
-    rows = []
-
-    sub = df_exp[
-        (df_exp["symbol"] == symbol) &
-        (df_exp["option_type"] == option_type)
-    ].copy()
-
-    if require_liquidity:
-        sub = sub[sub.apply(liquidity_ok, axis=1)].copy()
-
-    if sub.empty:
+    if chain.empty:
         return pd.DataFrame()
 
-    sub = sub.sort_values("strike").reset_index(drop=True)
+    df = chain.copy()
+    if require_liquidity:
+        df = df[df.apply(liquidity_ok, axis=1)].copy()
 
     atr14 = safe_float(zones.get("atr14"), np.nan)
     demand_low = safe_float(zones.get("demand_low"), np.nan)
     supply_high = safe_float(zones.get("supply_high"), np.nan)
 
-    for _, short_row in sub.iterrows():
-        short_delta_abs = safe_float(short_row["delta_abs"], np.nan)
-        short_strike = safe_float(short_row["strike"], np.nan)
-        short_mid = safe_float(short_row["mid"], np.nan)
+    if trend == "Uptrend" and np.isfinite(demand_low) and np.isfinite(atr14):
+        target_short = demand_low - (atr14 * atr_buffer_mult)
+        puts = df[df["option_type"] == "put"].copy()
+        puts = puts[puts["strike"] < target_short].sort_values("strike", ascending=False).head(limit)
+        if puts.empty:
+            return pd.DataFrame()
+        return puts[["expiration", "dte", "strike", "delta", "mid", "oi", "volume"]].rename(
+            columns={"strike": "candidate_short_strike", "delta": "candidate_delta", "mid": "candidate_mid"}
+        )
 
-        if not np.isfinite(short_strike) or not np.isfinite(short_mid):
-            continue
+    if trend == "Downtrend" and np.isfinite(supply_high) and np.isfinite(atr14):
+        target_short = supply_high + (atr14 * atr_buffer_mult)
+        calls = df[df["option_type"] == "call"].copy()
+        calls = calls[calls["strike"] > target_short].sort_values("strike", ascending=True).head(limit)
+        if calls.empty:
+            return pd.DataFrame()
+        return calls[["expiration", "dte", "strike", "delta", "mid", "oi", "volume"]].rename(
+            columns={"strike": "candidate_short_strike", "delta": "candidate_delta", "mid": "candidate_mid"}
+        )
 
-        zone_ok = False
-        zone_distance = np.nan
-        zone_label = "Unknown"
-
-        if strategy == "bull_put":
-            if not (np.isfinite(demand_low) and np.isfinite(atr14)):
-                continue
-
-            safe_threshold = demand_low - (atr14 * atr_buffer_mult)
-            zone_distance = demand_low - short_strike
-            zone_ok = short_strike < safe_threshold
-            zone_label = "Ideal" if zone_ok else "Near Zone"
-            candidates = sub[sub["strike"] < short_strike].copy()
-
-        elif strategy == "bear_call":
-            if not (np.isfinite(supply_high) and np.isfinite(atr14)):
-                continue
-
-            safe_threshold = supply_high + (atr14 * atr_buffer_mult)
-            zone_distance = short_strike - supply_high
-            zone_ok = short_strike > safe_threshold
-            zone_label = "Ideal" if zone_ok else "Near Zone"
-            candidates = sub[sub["strike"] > short_strike].copy()
-
-        else:
-            continue
-
-        if candidates.empty:
-            continue
-
-        for _, long_row in candidates.iterrows():
-            long_strike = safe_float(long_row["strike"], np.nan)
-            long_mid = safe_float(long_row["mid"], np.nan)
-
-            if not np.isfinite(long_strike) or not np.isfinite(long_mid):
-                continue
-
-            width = abs(short_strike - long_strike)
-            if width <= 0 or width > max_width:
-                continue
-
-            credit = short_mid - long_mid
-            if not np.isfinite(credit) or credit <= 0:
-                continue
-            if credit >= width:
-                continue
-
-            credit_dollars = credit * 100.0
-            max_risk = (width - credit) * 100.0
-            if max_risk <= 0 or max_risk > max_risk_dollars:
-                continue
-
-            pop = approx_pop_from_short_delta(short_delta_abs) if np.isfinite(short_delta_abs) else np.nan
-            ev = expected_value(credit_dollars, max_risk, pop) if np.isfinite(pop) else np.nan
-            score = spread_score(credit_dollars, max_risk, pop) if np.isfinite(pop) else np.nan
-
-            take_profit_dollars = credit_dollars * DEFAULT_TAKE_PROFIT_PCT
-            buyback_target_dollars = credit_dollars * (1.0 - DEFAULT_TAKE_PROFIT_PCT)
-
-            rows.append(
-                {
-                    "symbol": symbol,
-                    "expiration": short_row["expiration"],
-                    "dte": short_row["dte"],
-                    "strategy": strategy,
-                    "short_strike": short_strike,
-                    "long_strike": long_strike,
-                    "width": width,
-                    "short_delta": short_row["delta"],
-                    "credit": round(credit_dollars, 2),
-                    "max_risk": round(max_risk, 2),
-                    "pop": round(pop, 4) if np.isfinite(pop) else np.nan,
-                    "ev": round(ev, 2) if np.isfinite(ev) else np.nan,
-                    "score": round(score, 4) if np.isfinite(score) else np.nan,
-                    "roi_on_risk": round(credit_dollars / max_risk, 4),
-                    "zone_distance": round(zone_distance, 2) if np.isfinite(zone_distance) else np.nan,
-                    "zone_ok": zone_ok,
-                    "zone_label": zone_label,
-                    "take_profit_dollars": round(take_profit_dollars, 2),
-                    "buyback_target_dollars": round(buyback_target_dollars, 2),
-                    "short_mid": round(short_mid, 2),
-                    "long_mid": round(long_mid, 2),
-                }
-            )
-
-    return pd.DataFrame(rows)
-
-
-def scan_zone_spreads(
-    chain: pd.DataFrame,
-    account_size: float,
-    max_risk_pct: float,
-    min_dte: int,
-    max_dte: int,
-    max_width: float,
-    require_liquidity: bool,
-    trend: str,
-    zones: dict,
-    atr_buffer_mult: float,
-):
-    allowed = trend_allowed_strategies(trend)
-    if not allowed:
-        return pd.DataFrame()
-
-    df = chain.copy()
-    max_risk_dollars = account_size * max_risk_pct
-    symbols = sorted(df["symbol"].dropna().astype(str).unique().tolist())
-    out_parts = []
-
-    for symbol in symbols:
-        sym_df = df[
-            (df["symbol"] == symbol) &
-            (df["dte"] >= min_dte) &
-            (df["dte"] <= max_dte)
-        ].copy()
-
-        if sym_df.empty:
-            continue
-
-        expirations = sym_df["expiration"].dropna().unique().tolist()
-
-        for exp in expirations:
-            df_exp = sym_df[sym_df["expiration"] == exp].copy()
-
-            if "bull_put" in allowed:
-                puts = build_zone_spreads_for_expiration(
-                    df_exp=df_exp,
-                    symbol=symbol,
-                    option_type="put",
-                    strategy="bull_put",
-                    max_width=max_width,
-                    max_risk_dollars=max_risk_dollars,
-                    require_liquidity=require_liquidity,
-                    zones=zones,
-                    atr_buffer_mult=atr_buffer_mult,
-                )
-                if not puts.empty:
-                    out_parts.append(puts)
-
-            if "bear_call" in allowed:
-                calls = build_zone_spreads_for_expiration(
-                    df_exp=df_exp,
-                    symbol=symbol,
-                    option_type="call",
-                    strategy="bear_call",
-                    max_width=max_width,
-                    max_risk_dollars=max_risk_dollars,
-                    require_liquidity=require_liquidity,
-                    zones=zones,
-                    atr_buffer_mult=atr_buffer_mult,
-                )
-                if not calls.empty:
-                    out_parts.append(calls)
-
-    if not out_parts:
-        return pd.DataFrame()
-
-    out = pd.concat(out_parts, ignore_index=True)
-    out["spread_name"] = np.where(
-        out["strategy"] == "bull_put",
-        out["short_strike"].astype(str) + "/" + out["long_strike"].astype(str) + " Bull Put",
-        out["short_strike"].astype(str) + "/" + out["long_strike"].astype(str) + " Bear Call",
-    )
-    out["pop_pct"] = (out["pop"] * 100.0).round(1)
-    out["roi_pct"] = (out["roi_on_risk"] * 100.0).round(1)
-
-    return out.sort_values(
-        ["zone_ok", "score", "zone_distance", "ev", "credit"],
-        ascending=[False, False, False, False, False],
-    ).reset_index(drop=True)
-
-
-# =========================================================
-# PHASE 3 - SCORING
-# =========================================================
-def rate_trade(row, trend: str, zones: dict) -> dict:
-    total = 0
-
-    if trend == "Uptrend" and row["strategy"] == "bull_put":
-        trend_score = 30
-    elif trend == "Downtrend" and row["strategy"] == "bear_call":
-        trend_score = 30
-    else:
-        trend_score = 0
-    total += trend_score
-
-    zone_distance = safe_float(row.get("zone_distance"), np.nan)
-    atr14 = safe_float(zones.get("atr14"), np.nan)
-    zone_ok = bool(row.get("zone_ok", False))
-
-    if zone_ok and np.isfinite(zone_distance) and np.isfinite(atr14):
-        ratio = zone_distance / atr14 if atr14 > 0 else 0
-        if ratio >= 1.0:
-            zone_score = 30
-        elif ratio >= 0.5:
-            zone_score = 24
-        else:
-            zone_score = 18
-    elif np.isfinite(zone_distance) and np.isfinite(atr14):
-        ratio = zone_distance / atr14 if atr14 > 0 else 0
-        if ratio >= 0.10:
-            zone_score = 10
-        else:
-            zone_score = 3
-    else:
-        zone_score = 0
-    total += zone_score
-
-    credit = safe_float(row.get("credit"), np.nan)
-    max_risk = safe_float(row.get("max_risk"), np.nan)
-    roi = credit / max_risk if np.isfinite(credit) and np.isfinite(max_risk) and max_risk > 0 else 0
-    if roi >= 0.18:
-        rr_score = 15
-    elif roi >= 0.12:
-        rr_score = 10
-    elif roi >= 0.08:
-        rr_score = 6
-    else:
-        rr_score = 2
-    total += rr_score
-
-    delta_abs = abs(safe_float(row.get("short_delta"), np.nan))
-    if np.isfinite(delta_abs):
-        if 0.10 <= delta_abs <= 0.22:
-            delta_score = 10
-        elif 0.23 <= delta_abs <= 0.30:
-            delta_score = 7
-        elif delta_abs < 0.10:
-            delta_score = 5
-        else:
-            delta_score = 3
-    else:
-        delta_score = 0
-    total += delta_score
-
-    ev = safe_float(row.get("ev"), np.nan)
-    if np.isfinite(ev):
-        if ev >= 8:
-            ev_score = 15
-        elif ev >= 4:
-            ev_score = 10
-        elif ev >= 0:
-            ev_score = 5
-        else:
-            ev_score = 1
-    else:
-        ev_score = 0
-    total += ev_score
-
-    if total >= 80:
-        grade = "A Setup"
-    elif total >= 60:
-        grade = "B Setup"
-    else:
-        grade = "Avoid"
-
-    return {
-        "trade_score": total,
-        "grade": grade,
-        "trend_score": trend_score,
-        "zone_score": zone_score,
-        "rr_score": rr_score,
-        "delta_score": delta_score,
-        "ev_score": ev_score,
-    }
+    return pd.DataFrame()
 
 
 # =========================================================
@@ -915,7 +796,7 @@ run_scan = st.button("Load Data / Scan", use_container_width=True)
 # =========================================================
 # MAIN
 # =========================================================
-tabs = st.tabs(["Dashboard", "Spread Suggestions", "Growth", "Debug"])
+tabs = st.tabs(["Dashboard", "Suggested Spread", "Growth", "Debug"])
 symbols = [s.strip().upper() for s in symbol_input.split(",") if s.strip()]
 
 if not run_scan:
@@ -946,15 +827,15 @@ else:
 
             # DASHBOARD
             with tabs[0]:
-                st.subheader("Phase 1 — Trend + Supply/Demand Dashboard")
+                st.subheader("Trend + Zone Dashboard")
 
-                dashboard_rows = []
+                rows = []
                 for sym in symbols:
                     trend_info = all_trends.get(sym, {})
                     zones = all_zones.get(sym, {})
                     price = safe_float(trend_info.get("last_close"), np.nan)
 
-                    dashboard_rows.append(
+                    rows.append(
                         {
                             "symbol": sym,
                             "trend": trend_info.get("trend"),
@@ -970,8 +851,7 @@ else:
                         }
                     )
 
-                dashboard_df = pd.DataFrame(dashboard_rows)
-                st.dataframe(dashboard_df, use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
                 selected_symbol = st.selectbox("View Ticker Detail", options=symbols, index=0, key="dashboard_symbol")
                 candles = all_candles.get(selected_symbol, pd.DataFrame())
@@ -994,17 +874,17 @@ else:
 
                     z1, z2 = st.columns(2)
                     with z1:
-                        st.markdown("**Demand Zone**")
+                        st.markdown("**Demand / Support Zone**")
                         st.write(f"{zones.get('demand_low')} to {zones.get('demand_high')}")
                     with z2:
-                        st.markdown("**Supply Zone**")
+                        st.markdown("**Supply / Resistance Zone**")
                         st.write(f"{zones.get('supply_low')} to {zones.get('supply_high')}")
 
-            # SPREAD SUGGESTIONS
+            # SUGGESTED SPREAD
             with tabs[1]:
-                st.subheader("Phase 2 + 3 — Trend-Aligned Spread Suggestions")
+                st.subheader("Suggested Spread to Look At")
 
-                spread_symbol = st.selectbox("Ticker for Spread Suggestions", options=symbols, index=0, key="spread_symbol")
+                spread_symbol = st.selectbox("Ticker", options=symbols, index=0, key="spread_symbol")
                 trend_info = all_trends.get(spread_symbol, {})
                 zones = all_zones.get(spread_symbol, {})
                 chain = all_chains.get(spread_symbol, pd.DataFrame())
@@ -1015,114 +895,89 @@ else:
 
                 st.write(f"**Trend:** {trend} ({strength})")
                 st.write(f"**Current Price:** {price}")
-                st.write(f"**Demand Zone:** {zones.get('demand_low')} to {zones.get('demand_high')}")
-                st.write(f"**Supply Zone:** {zones.get('supply_low')} to {zones.get('supply_high')}")
+                st.write(f"**Demand / Support Zone:** {zones.get('demand_low')} to {zones.get('demand_high')}")
+                st.write(f"**Supply / Resistance Zone:** {zones.get('supply_low')} to {zones.get('supply_high')}")
 
                 if chain.empty:
                     st.info("No option chain returned.")
                 else:
-                    spread_results = scan_zone_spreads(
+                    suggestion = find_nearest_zone_based_spread(
                         chain=chain,
-                        account_size=account_size,
-                        max_risk_pct=max_risk_pct,
-                        min_dte=min_dte,
-                        max_dte=max_dte,
-                        max_width=max_width,
+                        trend=trend,
+                        zones=zones,
+                        width=max_width,
+                        atr_buffer_mult=atr_zone_buffer,
                         require_liquidity=require_liquidity,
+                    )
+
+                    backups = find_backup_zone_strikes(
+                        chain=chain,
                         trend=trend,
                         zones=zones,
                         atr_buffer_mult=atr_zone_buffer,
+                        require_liquidity=require_liquidity,
+                        limit=5,
                     )
 
-                    if spread_results.empty:
-                        st.info("No qualifying trend-aligned spreads outside the zones.")
+                    diagnostics = {}
+                    atr14 = safe_float(zones.get("atr14"), np.nan)
+
+                    if trend == "Uptrend":
+                        demand_low = safe_float(zones.get("demand_low"), np.nan)
+                        if np.isfinite(demand_low) and np.isfinite(atr14):
+                            diagnostics["target_short_below"] = round(demand_low - (atr14 * atr_zone_buffer), 2)
+                        put_chain = chain[chain["option_type"] == "put"]
+                        if not put_chain.empty:
+                            diagnostics["lowest_put_returned"] = safe_float(put_chain["strike"].min(), np.nan)
+                            diagnostics["highest_put_returned"] = safe_float(put_chain["strike"].max(), np.nan)
+
+                    elif trend == "Downtrend":
+                        supply_high = safe_float(zones.get("supply_high"), np.nan)
+                        if np.isfinite(supply_high) and np.isfinite(atr14):
+                            diagnostics["target_short_above"] = round(supply_high + (atr14 * atr_zone_buffer), 2)
+                        call_chain = chain[chain["option_type"] == "call"]
+                        if not call_chain.empty:
+                            diagnostics["lowest_call_returned"] = safe_float(call_chain["strike"].min(), np.nan)
+                            diagnostics["highest_call_returned"] = safe_float(call_chain["strike"].max(), np.nan)
+
+                    st.write("Diagnostics:", diagnostics)
+
+                    if suggestion is None:
+                        st.info("No valid zone-based spread suggestion found.")
                     else:
-                        scores = spread_results.apply(lambda r: pd.Series(rate_trade(r, trend, zones)), axis=1)
-                        spread_results = pd.concat([spread_results, scores], axis=1)
-
-                        diagnostic = {}
-                        if trend == "Downtrend":
-                            diagnostic["needed_short_call_above"] = (
-                                round(safe_float(zones.get("supply_high"), np.nan) + safe_float(zones.get("atr14"), 0) * atr_zone_buffer, 2)
-                                if np.isfinite(safe_float(zones.get("supply_high"), np.nan)) and np.isfinite(safe_float(zones.get("atr14"), np.nan))
-                                else np.nan
+                        if pd.isna(suggestion["short_strike"]):
+                            st.warning(suggestion["reason"])
+                        else:
+                            qty = contracts_allowed(
+                                max_risk_per_trade=suggestion["max_risk"],
+                                account_size=account_size,
+                                total_risk_cap_pct=DEFAULT_TOTAL_RISK_CAP_PCT,
                             )
-                            if not chain[chain["option_type"] == "call"].empty:
-                                diagnostic["highest_call_strike_returned"] = safe_float(
-                                    chain[chain["option_type"] == "call"]["strike"].max(), np.nan
-                                )
-                        elif trend == "Uptrend":
-                            diagnostic["needed_short_put_below"] = (
-                                round(safe_float(zones.get("demand_low"), np.nan) - safe_float(zones.get("atr14"), 0) * atr_zone_buffer, 2)
-                                if np.isfinite(safe_float(zones.get("demand_low"), np.nan)) and np.isfinite(safe_float(zones.get("atr14"), np.nan))
-                                else np.nan
-                            )
-                            if not chain[chain["option_type"] == "put"].empty:
-                                diagnostic["lowest_put_strike_returned"] = safe_float(
-                                    chain[chain["option_type"] == "put"]["strike"].min(), np.nan
-                                )
 
-                        st.write("Spread diagnostics:", diagnostic)
-
-                        show_cols = [
-                            "symbol",
-                            "expiration",
-                            "dte",
-                            "spread_name",
-                            "zone_label",
-                            "short_delta",
-                            "credit",
-                            "max_risk",
-                            "zone_distance",
-                            "pop_pct",
-                            "roi_pct",
-                            "ev",
-                            "trade_score",
-                            "grade",
-                            "take_profit_dollars",
-                        ]
-                        st.dataframe(spread_results[show_cols], use_container_width=True, hide_index=True)
-
-                        top = spread_results.iloc[0]
-                        qty = contracts_allowed(
-                            max_risk_per_trade=top["max_risk"],
-                            account_size=account_size,
-                            total_risk_cap_pct=DEFAULT_TOTAL_RISK_CAP_PCT,
-                        )
-
-                        st.markdown("### Best Suggestion")
-                        st.write(
-                            f"""
-**Ticker:** {top['symbol']}  
-**Trend:** {trend}  
-**Suggested Spread:** {top['spread_name']}  
-**Zone Status:** {top['zone_label']}  
-**Credit:** ${top['credit']:.2f}  
-**Max Risk:** ${top['max_risk']:.2f}  
-**Short Delta:** {top['short_delta']:.3f}  
-**Zone Distance:** {top['zone_distance']:.2f}  
-**POP:** {top['pop_pct']:.1f}%  
-**Trade Score:** {top['trade_score']} / 100  
-**Grade:** {top['grade']}  
-**Take Profit:** ${top['take_profit_dollars']:.2f}  
-**Buyback Target:** ${top['buyback_target_dollars']:.2f}  
+                            st.markdown("### Main Suggestion")
+                            st.write(
+                                f"""
+**Strategy:** {suggestion['strategy']}  
+**Zone Type:** {suggestion['zone_type']}  
+**Zone:** {suggestion['zone_low']} to {suggestion['zone_high']}  
+**Target Short Strike:** {suggestion['target_short_strike']}  
+**Suggested Short Strike:** {suggestion['short_strike']}  
+**Suggested Long Strike:** {suggestion['long_strike']}  
+**Expiration:** {suggestion['expiration']}  
+**DTE:** {int(suggestion['dte']) if pd.notna(suggestion['dte']) else 'N/A'}  
+**Short Delta:** {suggestion['short_delta']:.3f}  
+**Credit:** ${suggestion['credit']:.2f}  
+**Max Risk:** ${suggestion['max_risk']:.2f}  
+**Reason:** {suggestion['reason']}  
 **Contracts Allowed:** {qty}
 """
-                        )
-
-                        st.markdown("### Top 5 Cards")
-                        for _, row in spread_results.head(5).iterrows():
-                            st.markdown(
-                                f"""
-**{row['spread_name']}**  
-Zone Status: **{row['zone_label']}**  
-DTE: **{int(row['dte'])}** | Short Delta: **{row['short_delta']:.3f}**  
-Credit: **${row['credit']:.2f}** | Max Risk: **${row['max_risk']:.2f}**  
-Zone Distance: **{row['zone_distance']:.2f}** | POP: **{row['pop_pct']:.1f}%**  
-Score: **{row['trade_score']}** | Grade: **{row['grade']}**
-"""
                             )
-                            st.divider()
+
+                    st.markdown("### Backup Short Strikes to Look At")
+                    if backups.empty:
+                        st.info("No backup strikes found.")
+                    else:
+                        st.dataframe(backups, use_container_width=True, hide_index=True)
 
             # GROWTH
             with tabs[2]:
@@ -1137,36 +992,28 @@ Score: **{row['trade_score']}** | Grade: **{row['grade']}**
                 chain = all_chains.get(growth_symbol, pd.DataFrame())
                 trend = trend_info.get("trend", "Unknown")
 
-                growth_spreads = scan_zone_spreads(
+                suggestion = find_nearest_zone_based_spread(
                     chain=chain,
-                    account_size=account_size,
-                    max_risk_pct=max_risk_pct,
-                    min_dte=min_dte,
-                    max_dte=max_dte,
-                    max_width=max_width,
-                    require_liquidity=require_liquidity,
                     trend=trend,
                     zones=zones,
+                    width=max_width,
                     atr_buffer_mult=atr_zone_buffer,
+                    require_liquidity=require_liquidity,
                 )
 
-                if growth_spreads.empty:
-                    st.info("No spreads available for growth projection.")
+                if suggestion is None or pd.isna(suggestion.get("credit")) or pd.isna(suggestion.get("max_risk")):
+                    st.info("No usable spread available for growth projection.")
                 else:
-                    scores = growth_spreads.apply(lambda r: pd.Series(rate_trade(r, trend, zones)), axis=1)
-                    growth_spreads = pd.concat([growth_spreads, scores], axis=1)
-
-                    model_trade = growth_spreads.iloc[0]
                     fixed_df = project_growth_fixed(
                         start_balance=account_size,
-                        avg_win=model_trade["credit"],
-                        avg_loss=model_trade["max_risk"],
+                        avg_win=suggestion["credit"],
+                        avg_loss=suggestion["max_risk"],
                         win_rate=assumed_win_rate,
                         num_trades=int(growth_trades),
                     )
 
                     end_balance = fixed_df.iloc[-1]["expected_balance"] if not fixed_df.empty else account_size
-                    ev_per_trade = (assumed_win_rate * model_trade["credit"]) - ((1 - assumed_win_rate) * model_trade["max_risk"])
+                    ev_per_trade = (assumed_win_rate * suggestion["credit"]) - ((1 - assumed_win_rate) * suggestion["max_risk"])
 
                     c1, c2, c3 = st.columns(3)
                     with c1:
@@ -1176,15 +1023,14 @@ Score: **{row['trade_score']}** | Grade: **{row['grade']}**
                     with c3:
                         st.metric("Projected End Balance", f"${end_balance:,.2f}")
 
-                    st.markdown("### Model Trade")
+                    st.markdown("### Model Spread Used")
                     st.write(
                         f"""
-**{model_trade['symbol']} — {model_trade['spread_name']}**  
-Trend: **{trend}**  
-Zone Status: **{model_trade['zone_label']}**  
-Credit: **${model_trade['credit']:.2f}**  
-Max Risk: **${model_trade['max_risk']:.2f}**  
-Trade Score: **{model_trade['trade_score']}**
+**{growth_symbol} — {suggestion['strategy']}**  
+Short Strike: **{suggestion['short_strike']}**  
+Long Strike: **{suggestion['long_strike']}**  
+Credit: **${suggestion['credit']:.2f}**  
+Max Risk: **${suggestion['max_risk']:.2f}**
 """
                     )
 
