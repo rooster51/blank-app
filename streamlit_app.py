@@ -1,4 +1,3 @@
-import math
 import time as pytime
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
@@ -62,16 +61,6 @@ def round_to_increment(price: float, increment: float) -> float:
     return round(round(price / increment) * increment, 2)
 
 
-def infer_strike_increment(spot: float) -> float:
-    if spot < 50:
-        return 0.5
-    if spot < 200:
-        return 1.0
-    if spot < 500:
-        return 1.0
-    return 5.0
-
-
 def normalize_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -82,6 +71,78 @@ def normalize_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
         df.index = df.index.tz_localize("UTC")
     df.index = df.index.tz_convert(APP_TZ)
     return df.sort_index()
+
+
+def fmt_num(value, digits=2, default="N/A"):
+    if value is None:
+        return default
+    try:
+        if pd.isna(value):
+            return default
+        return f"{float(value):,.{digits}f}"
+    except Exception:
+        return default
+
+
+def fmt_pct(value, digits=1, default="N/A"):
+    if value is None:
+        return default
+    try:
+        if pd.isna(value):
+            return default
+        return f"{float(value) * 100:.{digits}f}%"
+    except Exception:
+        return default
+
+
+def yes_no(value):
+    return "Yes" if bool(value) else "No"
+
+
+def quality_label(score: int) -> str:
+    if score >= 85:
+        return "A"
+    if score >= 70:
+        return "B"
+    if score >= 55:
+        return "C"
+    return "D"
+
+
+def quality_text(score: int) -> str:
+    label = quality_label(score)
+    mapping = {
+        "A": "A Setup",
+        "B": "B Setup",
+        "C": "C Setup",
+        "D": "D Setup",
+    }
+    return mapping[label]
+
+
+def setup_bias_text(profile: dict) -> str:
+    return str(profile.get("direction", "neutral")).replace("_", " ").title()
+
+
+def leg_summary_df(*legs):
+    rows = []
+    for label, leg in legs:
+        if not leg:
+            continue
+        rows.append(
+            {
+                "Leg": label,
+                "Strike": fmt_num(leg.get("strike")),
+                "Bid": fmt_num(leg.get("bid")),
+                "Ask": fmt_num(leg.get("ask")),
+                "Mid": fmt_num(leg.get("mid")),
+                "Delta": fmt_num(leg.get("delta"), 3),
+                "IV": fmt_pct(leg.get("iv"), 1),
+                "OI": fmt_num(leg.get("openInterest"), 0),
+                "Vol": fmt_num(leg.get("volume"), 0),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 # =========================================================
@@ -195,41 +256,20 @@ def chain_json_to_df(data: dict) -> pd.DataFrame:
     if "s" in data and isinstance(data["s"], list):
         return pd.DataFrame(data["s"])
 
-    keys = [
-        "symbol",
-        "underlying",
-        "expiration",
-        "side",
-        "strike",
-        "bid",
-        "ask",
-        "mid",
-        "last",
-        "delta",
-        "gamma",
-        "theta",
-        "vega",
-        "iv",
-        "openInterest",
-        "volume",
-    ]
-
     length = 0
-    for k in data.keys():
-        if isinstance(data[k], list):
-            length = max(length, len(data[k]))
+    for value in data.values():
+        if isinstance(value, list):
+            length = max(length, len(value))
 
     if length == 0:
         return pd.DataFrame()
 
     out = {}
-    for key in keys:
-        val = data.get(key, [])
-        if isinstance(val, list) and len(val) == length:
-            out[key] = val
+    for key, value in data.items():
+        if isinstance(value, list) and len(value) == length:
+            out[key] = value
 
-    df = pd.DataFrame(out)
-    return df
+    return pd.DataFrame(out)
 
 
 # =========================================================
@@ -263,6 +303,7 @@ def add_volume_metrics(df: pd.DataFrame, vol_period: int = 20, spike_threshold: 
 def get_trend_from_emas(df: pd.DataFrame, fast: int = 20, slow: int = 50) -> str:
     if df.empty or len(df) < slow + 5:
         return "neutral"
+
     ema_fast = df["Close"].ewm(span=fast, adjust=False).mean()
     ema_slow = df["Close"].ewm(span=slow, adjust=False).mean()
 
@@ -504,12 +545,7 @@ def suggest_trade_levels(result: dict, profile: dict, spot: float, width: float,
         else:
             short_strike = round_to_increment(support - atr * atr_mult, strike_increment)
             long_strike = round_to_increment(short_strike - width, strike_increment)
-
-        return {
-            "option_side": "put",
-            "short_strike": short_strike,
-            "long_strike": long_strike,
-        }
+        return {"option_side": "put", "short_strike": short_strike, "long_strike": long_strike}
 
     if profile["strategy"] == "Call Credit Spread":
         if spread and spread.get("type") == "call_credit":
@@ -518,51 +554,31 @@ def suggest_trade_levels(result: dict, profile: dict, spot: float, width: float,
         else:
             short_strike = round_to_increment(resistance + atr * atr_mult, strike_increment)
             long_strike = round_to_increment(short_strike + width, strike_increment)
-
-        return {
-            "option_side": "call",
-            "short_strike": short_strike,
-            "long_strike": long_strike,
-        }
+        return {"option_side": "call", "short_strike": short_strike, "long_strike": long_strike}
 
     if profile["strategy"] == "Put Debit Spread":
         long_strike = round_to_increment(spot, strike_increment)
         short_strike = round_to_increment(long_strike - width, strike_increment)
-        return {
-            "option_side": "put",
-            "long_strike": long_strike,
-            "short_strike": short_strike,
-        }
+        return {"option_side": "put", "long_strike": long_strike, "short_strike": short_strike}
 
     if profile["strategy"] == "Call Debit Spread":
         long_strike = round_to_increment(spot, strike_increment)
         short_strike = round_to_increment(long_strike + width, strike_increment)
-        return {
-            "option_side": "call",
-            "long_strike": long_strike,
-            "short_strike": short_strike,
-        }
+        return {"option_side": "call", "long_strike": long_strike, "short_strike": short_strike}
 
     if profile["strategy"] == "Cash Secured Put":
         short_strike = round_to_increment(support - atr * atr_mult, strike_increment)
-        return {
-            "option_side": "put",
-            "short_strike": short_strike,
-        }
+        return {"option_side": "put", "short_strike": short_strike}
 
     if profile["strategy"] == "Covered Call":
         short_strike = round_to_increment(resistance + atr * atr_mult, strike_increment)
-        return {
-            "option_side": "call",
-            "short_strike": short_strike,
-        }
+        return {"option_side": "call", "short_strike": short_strike}
 
     if profile["strategy"] == "Iron Condor":
         put_short = round_to_increment(support - atr * atr_mult, strike_increment)
         put_long = round_to_increment(put_short - width, strike_increment)
         call_short = round_to_increment(resistance + atr * atr_mult, strike_increment)
         call_long = round_to_increment(call_short + width, strike_increment)
-
         return {
             "option_side": "both",
             "put_short": put_short,
@@ -974,79 +990,292 @@ def build_trade_from_chain(profile: dict, levels: dict, options_data: dict):
 
 
 # =========================================================
-# SIDEBAR
+# DISPLAY HELPERS
 # =========================================================
-st.sidebar.header("Controls")
+def show_top_snapshot(result: dict):
+    st.subheader("Market Snapshot")
 
-symbol = st.sidebar.text_input("Ticker", value="SPY").upper().strip()
+    r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+    r1c1.metric("Ticker", result["symbol"])
+    r1c2.metric("Spot", fmt_num(result["spot"]))
+    r1c3.metric("Sweep", (result["sweep"] or "None").replace("_", " ").title())
+    r1c4.metric("Confidence", f'{result["confidence"]}%')
 
-strategy_choice = st.sidebar.selectbox(
-    "Strategy",
-    [
-        "Auto",
+    r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+    r2c1.metric("Support", fmt_num(result["support"]))
+    r2c2.metric("Resistance", fmt_num(result["resistance"]))
+    r2c3.metric("Rejection", result["rejection"].title())
+    r2c4.metric("Volume Spike", yes_no(result["volume_spike"]))
+
+    if result["in_no_trade_window"]:
+        st.warning(f"Do not trade right now: {result['reason']}")
+    elif result["is_valid"]:
+        st.success(result["reason"])
+    else:
+        st.info(result["reason"])
+
+
+def show_trade_quality(result: dict, profile: dict):
+    st.subheader("Trade Quality")
+
+    q1, q2, q3 = st.columns(3)
+    q1.metric("Quality Grade", quality_label(result["confidence"]))
+    q2.metric("Setup", quality_text(result["confidence"]))
+    q3.metric("Bias", setup_bias_text(profile))
+
+    if result["confidence"] >= 85:
+        st.success("This is one of the stronger setups on your scoring model.")
+    elif result["confidence"] >= 70:
+        st.info("This is a decent setup, but still needs discipline on entry and risk.")
+    elif result["confidence"] >= 55:
+        st.warning("This is more of a marginal setup. Be careful forcing trades here.")
+    else:
+        st.warning("Low quality setup. This is usually where getting chopped up starts.")
+
+
+def show_analysis_summary(result, profile, selected_expiration):
+    st.subheader("Setup Summary")
+
+    a1, a2, a3 = st.columns(3)
+    a1.metric("Strategy", profile["strategy"])
+    a2.metric("Direction Bias", setup_bias_text(profile))
+    a3.metric("Expiration", selected_expiration or "N/A")
+
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Spot", fmt_num(result["spot"]))
+    b2.metric("Support", fmt_num(result["support"]))
+    b3.metric("Resistance", fmt_num(result["resistance"]))
+    b4.metric("ATR", fmt_num(result["atr"]))
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Sweep", (result["sweep"] or "None").replace("_", " ").title())
+    c2.metric("Rejection", result["rejection"].title())
+    c3.metric("Volume Spike", yes_no(result["volume_spike"]))
+    c4.metric("Confidence", f"{result['confidence']}%")
+
+    mtf = result["mtf"]
+    st.caption(
+        f"Trend alignment — Daily: {mtf['daily']} | Hourly: {mtf['hourly']} | "
+        f"Intraday: {mtf['intraday']} | Aligned: {mtf['aligned']}"
+    )
+
+    if mtf.get("manual_override"):
+        st.caption("Manual trend override active.")
+
+
+def show_levels_clean(levels, profile):
+    st.subheader("Suggested Trade Levels")
+
+    if not levels:
+        st.warning("No levels available for this setup.")
+        return
+
+    strategy = profile["strategy"]
+
+    if strategy == "Iron Condor":
+        left, right = st.columns(2)
+
+        with left:
+            st.markdown("**Put Side**")
+            p1, p2 = st.columns(2)
+            p1.metric("Short Put", fmt_num(levels.get("put_short")))
+            p2.metric("Long Put", fmt_num(levels.get("put_long")))
+
+        with right:
+            st.markdown("**Call Side**")
+            c1, c2 = st.columns(2)
+            c1.metric("Short Call", fmt_num(levels.get("call_short")))
+            c2.metric("Long Call", fmt_num(levels.get("call_long")))
+        return
+
+    if strategy in {"Put Credit Spread", "Call Credit Spread", "Put Debit Spread", "Call Debit Spread"}:
+        l1, l2, l3 = st.columns(3)
+        l1.metric("Option Side", str(levels.get("option_side", "")).title())
+        l2.metric("Short Strike", fmt_num(levels.get("short_strike")))
+        l3.metric("Long Strike", fmt_num(levels.get("long_strike")))
+        return
+
+    if strategy in {"Cash Secured Put", "Covered Call"}:
+        l1, l2 = st.columns(2)
+        l1.metric("Option Side", str(levels.get("option_side", "")).title())
+        l2.metric("Strike", fmt_num(levels.get("short_strike")))
+
+
+def show_options_result(trade_result):
+    st.subheader("Options Result")
+
+    if not trade_result:
+        st.info("Press Load Options to pull contracts for your chosen setup.")
+        return
+
+    strategy = trade_result["strategy"]
+
+    if strategy == "Iron Condor":
+        top1, top2, top3 = st.columns(3)
+        top1.metric("Estimated Credit", fmt_num(trade_result.get("estimated_value")))
+        top2.metric("Width", fmt_num(trade_result.get("width")))
+        top3.metric("Estimated Max Loss", fmt_num(trade_result.get("estimated_max_loss")))
+
+        put_df = leg_summary_df(
+            ("Short Put", trade_result.get("put_short")),
+            ("Long Put", trade_result.get("put_long")),
+        )
+        call_df = leg_summary_df(
+            ("Short Call", trade_result.get("call_short")),
+            ("Long Call", trade_result.get("call_long")),
+        )
+
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**Put Spread**")
+            st.dataframe(put_df, use_container_width=True, hide_index=True)
+        with right:
+            st.markdown("**Call Spread**")
+            st.dataframe(call_df, use_container_width=True, hide_index=True)
+
+    elif strategy in {
         "Put Credit Spread",
         "Call Credit Spread",
-        "Iron Condor",
         "Put Debit Spread",
         "Call Debit Spread",
-        "Cash Secured Put",
-        "Covered Call",
-    ],
-    index=0,
-)
+    }:
+        top1, top2, top3 = st.columns(3)
+        label = "Estimated Credit" if "Credit" in strategy else "Estimated Debit"
+        top1.metric(label, fmt_num(trade_result.get("estimated_value")))
+        top2.metric("Width", fmt_num(trade_result.get("width")))
+        top3.metric("Estimated Max Loss", fmt_num(trade_result.get("estimated_max_loss")))
 
-expiration_mode = st.sidebar.selectbox(
-    "Expiration Selection",
-    ["Auto", "Nearest Weekly", "14 DTE", "30 DTE"],
-    index=0,
-)
+        legs_df = leg_summary_df(
+            ("Short Leg", trade_result.get("short_leg")),
+            ("Long Leg", trade_result.get("long_leg")),
+        )
+        st.dataframe(legs_df, use_container_width=True, hide_index=True)
 
-manual_trend_override = st.sidebar.selectbox(
-    "Trend override",
-    ["auto", "bullish", "bearish", "neutral"],
-    index=0,
-)
+    elif strategy in {"Cash Secured Put", "Covered Call"}:
+        top1, top2 = st.columns(2)
+        top1.metric("Estimated Premium", fmt_num(trade_result.get("estimated_value")))
+        top2.metric("Expiration", str(trade_result.get("expiration", "N/A")))
 
-lookback = st.sidebar.slider("Sweep lookback bars", 10, 60, 20)
-atr_period = st.sidebar.slider("ATR period", 5, 30, 14)
-vol_period = st.sidebar.slider("Volume MA period", 5, 40, 20)
-vol_spike_threshold = st.sidebar.slider("Volume spike threshold", 1.0, 3.0, 1.5, 0.1)
-atr_mult = st.sidebar.slider("ATR multiplier", 0.25, 2.0, 0.75, 0.05)
+        leg_df = leg_summary_df(("Short Leg", trade_result.get("short_leg")))
+        st.dataframe(leg_df, use_container_width=True, hide_index=True)
 
-default_increment = 1.0
-strike_increment = st.sidebar.selectbox("Strike increment", [0.5, 1.0, 2.5, 5.0], index=1)
-spread_width = st.sidebar.number_input("Spread width", min_value=float(strike_increment), value=5.0, step=float(strike_increment))
-
-st.sidebar.subheader("Do-Not-Trade Windows")
-avoid_open_minutes = st.sidebar.slider("Avoid after open (minutes)", 0, 90, 15)
-avoid_close_minutes = st.sidebar.slider("Avoid before close (minutes)", 0, 120, 60)
-use_lunch_window = st.sidebar.checkbox("Block lunch window", value=False)
-lunch_start_h = st.sidebar.number_input("Lunch start hour", min_value=10, max_value=14, value=12)
-lunch_start_m = st.sidebar.number_input("Lunch start minute", min_value=0, max_value=59, value=0)
-lunch_end_h = st.sidebar.number_input("Lunch end hour", min_value=10, max_value=15, value=13)
-lunch_end_m = st.sidebar.number_input("Lunch end minute", min_value=0, max_value=59, value=0)
-use_midday_friday = st.sidebar.checkbox("Block Friday midday", value=True)
-
-st.sidebar.subheader("Run")
-analyze_clicked = st.sidebar.button("Analyze")
-load_options_clicked = st.sidebar.button("Load Options For Selected Strategy")
-
-if st.sidebar.button("Clear Cached Data"):
-    st.cache_data.clear()
-    st.session_state.pop("analysis_result", None)
-    st.session_state.pop("selected_levels", None)
-    st.session_state.pop("selected_profile", None)
-    st.session_state.pop("selected_expiration", None)
-    st.session_state.pop("trade_result", None)
-    st.success("Cache cleared.")
+    else:
+        st.write(trade_result)
 
 
 # =========================================================
-# MAIN FLOW
+# SESSION DEFAULTS
+# =========================================================
+defaults = {
+    "analysis_result": None,
+    "selected_profile": None,
+    "selected_levels": None,
+    "selected_expiration": None,
+    "trade_result": None,
+}
+for key, value in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+# =========================================================
+# HEADER / MOBILE-FIRST CONTROLS
 # =========================================================
 st.title("Low-Call MarketData Spread Finder")
 st.caption(f"Time now: {now_et().strftime('%Y-%m-%d %I:%M:%S %p ET')}")
 
+top1, top2 = st.columns(2)
+with top1:
+    symbol = st.text_input("Ticker", value="SPY").upper().strip()
+with top2:
+    strategy_choice = st.selectbox(
+        "Strategy",
+        [
+            "Auto",
+            "Put Credit Spread",
+            "Call Credit Spread",
+            "Iron Condor",
+            "Put Debit Spread",
+            "Call Debit Spread",
+            "Cash Secured Put",
+            "Covered Call",
+        ],
+        index=0,
+    )
+
+mid1, mid2 = st.columns(2)
+with mid1:
+    expiration_mode = st.selectbox(
+        "Expiration Selection",
+        ["Auto", "Nearest Weekly", "14 DTE", "30 DTE"],
+        index=0,
+    )
+with mid2:
+    manual_trend_override = st.selectbox(
+        "Trend Override",
+        ["auto", "bullish", "bearish", "neutral"],
+        index=0,
+    )
+
+run1, run2, run3 = st.columns(3)
+with run1:
+    analyze_clicked = st.button("Analyze", use_container_width=True)
+with run2:
+    load_options_clicked = st.button("Load Options", use_container_width=True)
+with run3:
+    clear_cache_clicked = st.button("Clear Cache", use_container_width=True)
+
+
+# =========================================================
+# ADVANCED SETTINGS
+# =========================================================
+with st.expander("Advanced Settings"):
+    adv1, adv2 = st.columns(2)
+    with adv1:
+        lookback = st.slider("Sweep lookback bars", 10, 60, 20)
+        atr_period = st.slider("ATR period", 5, 30, 14)
+        vol_period = st.slider("Volume MA period", 5, 40, 20)
+        vol_spike_threshold = st.slider("Volume spike threshold", 1.0, 3.0, 1.5, 0.1)
+    with adv2:
+        atr_mult = st.slider("ATR multiplier", 0.25, 2.0, 0.75, 0.05)
+        strike_increment = st.selectbox("Strike increment", [0.5, 1.0, 2.5, 5.0], index=1)
+        spread_width = st.number_input(
+            "Spread width",
+            min_value=float(strike_increment),
+            value=5.0,
+            step=float(strike_increment),
+        )
+
+with st.expander("Do-Not-Trade Windows"):
+    wnd1, wnd2 = st.columns(2)
+    with wnd1:
+        avoid_open_minutes = st.slider("Avoid after open (minutes)", 0, 90, 15)
+        avoid_close_minutes = st.slider("Avoid before close (minutes)", 0, 120, 60)
+        use_lunch_window = st.checkbox("Block lunch window", value=False)
+    with wnd2:
+        lunch_start_h = st.number_input("Lunch start hour", min_value=10, max_value=14, value=12)
+        lunch_start_m = st.number_input("Lunch start minute", min_value=0, max_value=59, value=0)
+        lunch_end_h = st.number_input("Lunch end hour", min_value=10, max_value=15, value=13)
+        lunch_end_m = st.number_input("Lunch end minute", min_value=0, max_value=59, value=0)
+        use_midday_friday = st.checkbox("Block Friday midday", value=True)
+
+
+# =========================================================
+# CACHE CLEAR
+# =========================================================
+if clear_cache_clicked:
+    st.cache_data.clear()
+    st.session_state["analysis_result"] = None
+    st.session_state["selected_profile"] = None
+    st.session_state["selected_levels"] = None
+    st.session_state["selected_expiration"] = None
+    st.session_state["trade_result"] = None
+    st.success("Cache cleared.")
+
+
+# =========================================================
+# ANALYZE
+# =========================================================
 if analyze_clicked:
     try:
         daily_df, hourly_df, intraday_df = fetch_core_data(symbol)
@@ -1102,63 +1331,32 @@ if analyze_clicked:
     except Exception as e:
         st.error(f"Analyze failed: {e}")
 
-if "analysis_result" not in st.session_state:
+
+# =========================================================
+# WAIT STATE
+# =========================================================
+if st.session_state["analysis_result"] is None:
     st.info("Press Analyze to load price data and generate strategy levels.")
     st.stop()
+
 
 result = st.session_state["analysis_result"]
 profile = st.session_state["selected_profile"]
 levels = st.session_state["selected_levels"]
 selected_expiration = st.session_state["selected_expiration"]
 
-# =========================================================
-# DASHBOARD
-# =========================================================
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Ticker", result["symbol"])
-c2.metric("Spot", f'{result["spot"]:.2f}')
-c3.metric("Sweep", result["sweep"] or "None")
-c4.metric("Confidence", f'{result["confidence"]}%')
-c5.metric("ATR", f'{result["atr"]:.2f}' if result["atr"] else "N/A")
-
-c6, c7, c8, c9 = st.columns(4)
-c6.metric("Support", f'{result["support"]:.2f}' if result["support"] else "N/A")
-c7.metric("Resistance", f'{result["resistance"]:.2f}' if result["resistance"] else "N/A")
-c8.metric("Rejection", result["rejection"].title())
-c9.metric("Volume Spike", "Yes" if result["volume_spike"] else "No")
-
-if result["in_no_trade_window"]:
-    st.warning(f"Do not trade right now: {result['reason']}")
-elif result["is_valid"]:
-    st.success(result["reason"])
-else:
-    st.info(result["reason"])
-
-st.subheader("Trend Alignment")
-mtf = result["mtf"]
-st.write(
-    f"Daily: **{mtf['daily']}** | "
-    f"Hourly: **{mtf['hourly']}** | "
-    f"Intraday: **{mtf['intraday']}** | "
-    f"Aligned: **{mtf['aligned']}**"
-)
-
-if mtf.get("manual_override"):
-    st.caption("Manual trend override active.")
-
-st.subheader("Selected Strategy")
-st.write(f"**Strategy:** {profile['strategy']}")
-st.write(f"**Direction Bias:** {profile['direction']}")
-st.write(f"**Chosen Expiration:** {selected_expiration or 'None found'}")
-
-st.subheader("Suggested Levels")
-if levels:
-    st.json(levels)
-else:
-    st.warning("Could not build levels for this strategy with the current data.")
 
 # =========================================================
-# OPTIONS LOAD
+# DISPLAY
+# =========================================================
+show_top_snapshot(result)
+show_trade_quality(result, profile)
+show_analysis_summary(result, profile, selected_expiration)
+show_levels_clean(levels, profile)
+
+
+# =========================================================
+# LOAD OPTIONS
 # =========================================================
 if load_options_clicked:
     try:
@@ -1178,68 +1376,44 @@ if load_options_clicked:
     except Exception as e:
         st.error(f"Options load failed: {e}")
 
+
 trade_result = st.session_state.get("trade_result")
+show_options_result(trade_result)
 
-st.subheader("Options Result")
-if trade_result:
-    if trade_result["strategy"] == "Iron Condor":
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.markdown("**Put Side**")
-            st.json(
-                {
-                    "put_short": trade_result["put_short"],
-                    "put_long": trade_result["put_long"],
-                }
-            )
-        with col_b:
-            st.markdown("**Call Side**")
-            st.json(
-                {
-                    "call_short": trade_result["call_short"],
-                    "call_long": trade_result["call_long"],
-                }
-            )
-
-        st.write(f"**Estimated Credit:** {trade_result['estimated_value']}")
-        st.write(f"**Width:** {trade_result['width']}")
-        st.write(f"**Estimated Max Loss:** {trade_result['estimated_max_loss']}")
-
-    elif trade_result["strategy"] in {"Put Credit Spread", "Call Credit Spread", "Put Debit Spread", "Call Debit Spread"}:
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.markdown("**Short Leg**")
-            st.json(trade_result["short_leg"])
-        with col_b:
-            st.markdown("**Long Leg**")
-            st.json(trade_result["long_leg"])
-
-        st.write(f"**Estimated Credit/Debit:** {trade_result['estimated_value']}")
-        st.write(f"**Width:** {trade_result['width']}")
-        st.write(f"**Estimated Max Loss:** {trade_result['estimated_max_loss']}")
-
-    else:
-        st.json(trade_result)
-else:
-    st.info("Press Load Options For Selected Strategy to pull contracts for your chosen setup.")
 
 # =========================================================
-# CHART / DATA
+# CHART / TABLE
 # =========================================================
-st.subheader("Intraday Chart")
+st.subheader("Intraday Trend")
 chart_df = result["intraday_df"][["Close", "EMA20", "EMA50"]].copy()
-st.line_chart(chart_df)
+st.line_chart(chart_df, use_container_width=True)
 
-with st.expander("Recent intraday bars"):
-    display_cols = ["Open", "High", "Low", "Close", "Volume", "ATR", "vol_ratio", "volume_spike", "EMA20", "EMA50"]
-    st.dataframe(result["intraday_df"][display_cols].tail(50), use_container_width=True)
+with st.expander("View Recent Bars"):
+    display_cols = [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume",
+        "ATR",
+        "vol_ratio",
+        "volume_spike",
+        "EMA20",
+        "EMA50",
+    ]
+    recent_df = result["intraday_df"][display_cols].tail(30).copy()
+    st.dataframe(recent_df, use_container_width=True)
 
-st.subheader("How This Saves API Calls")
-st.write(
-    """
+
+# =========================================================
+# NOTES
+# =========================================================
+with st.expander("How This Saves API Calls"):
+    st.write(
+        """
 - Price data only loads when you press **Analyze**
-- Options only load when you press **Load Options For Selected Strategy**
+- Options only load when you press **Load Options**
 - The app only pulls the side you asked for
 - It does not download full chains on every rerun
 """
-)
+    )
