@@ -1,33 +1,57 @@
 import math
+import time as pytime
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
-import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
-import yfinance as yf
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+st.set_page_config(page_title="Spread Finder", layout="wide")
 
 APP_TZ = ZoneInfo("America/New_York")
+BASE_URL = "https://api.marketdata.app/v1"
 
 
-# -----------------------------
-# Page config
-# -----------------------------
-st.set_page_config(page_title="Liquidity Sweep Spread Finder", layout="wide")
+# =========================================================
+# SECRETS / AUTH
+# =========================================================
+def get_api_token() -> str:
+    token = st.secrets.get("MARKETDATA_API_KEY", "")
+    if not token:
+        st.error("Missing MARKETDATA_API_KEY in Streamlit secrets.")
+        st.stop()
+    return token
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
+API_TOKEN = get_api_token()
+
+
+def make_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update({"Authorization": f"Bearer {API_TOKEN}"})
+    return session
+
+
+SESSION = make_session()
+
+
+# =========================================================
+# UTILS
+# =========================================================
 def now_et() -> datetime:
     return datetime.now(APP_TZ)
 
 
-def safe_float(x, default=None):
+def safe_float(value, default=None):
     try:
-        if pd.isna(x):
+        if pd.isna(value):
             return default
-        return float(x)
+        return float(value)
     except Exception:
         return default
 
@@ -39,84 +63,186 @@ def round_to_increment(price: float, increment: float) -> float:
 
 
 def infer_strike_increment(spot: float) -> float:
-    # Practical default for idea generation with liquid names
     if spot < 50:
         return 0.5
     if spot < 200:
         return 1.0
-    return 1.0
+    if spot < 500:
+        return 1.0
+    return 5.0
 
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
+def normalize_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy()
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index, errors="coerce", utc=True)
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    df.index = df.index.tz_convert(APP_TZ)
+    return df.sort_index()
+
+
+# =========================================================
+# MARKETDATA API
+# =========================================================
+@st.cache_data(ttl=300, show_spinner=False)
+def md_get(url: str, params: dict | None = None):
+    resp = SESSION.get(url, params=params, timeout=20)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def md_get_with_retry(url: str, params: dict | None = None, retries: int = 3, sleep_seconds: int = 2):
+    last_error = None
+    for attempt in range(retries):
+        try:
+            return md_get(url, params)
+        except Exception as e:
+            last_error = e
+            if attempt < retries - 1:
+                pytime.sleep(sleep_seconds * (attempt + 1))
+            else:
+                raise last_error
+    raise last_error
+
+
+def build_candles_df(data: dict) -> pd.DataFrame:
+    if not data:
         return pd.DataFrame()
 
-    out = df.copy()
+    t = data.get("t", [])
+    o = data.get("o", [])
+    h = data.get("h", [])
+    l = data.get("l", [])
+    c = data.get("c", [])
+    v = data.get("v", [])
 
-    # Flatten MultiIndex columns if needed
-    if isinstance(out.columns, pd.MultiIndex):
-        out.columns = [c[0] if isinstance(c, tuple) else c for c in out.columns]
+    if not t or not c:
+        return pd.DataFrame()
 
-    keep = {}
-    for c in out.columns:
-        name = str(c).strip().lower()
-        if name == "open":
-            keep[c] = "Open"
-        elif name == "high":
-            keep[c] = "High"
-        elif name == "low":
-            keep[c] = "Low"
-        elif name == "close":
-            keep[c] = "Close"
-        elif name == "adj close":
-            keep[c] = "Adj Close"
-        elif name == "volume":
-            keep[c] = "Volume"
+    df = pd.DataFrame(
+        {
+            "Date": pd.to_datetime(t, unit="s", utc=True),
+            "Open": o,
+            "High": h,
+            "Low": l,
+            "Close": c,
+            "Volume": v if v else [0] * len(t),
+        }
+    ).set_index("Date")
 
-    out = out.rename(columns=keep)
-    needed = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in out.columns]
-    out = out[needed].copy()
+    return normalize_datetime_index(df)
 
-    if not isinstance(out.index, pd.DatetimeIndex):
-        out.index = pd.to_datetime(out.index, errors="coerce")
 
-    out = out.dropna(subset=["Open", "High", "Low", "Close"])
-    if "Volume" not in out.columns:
-        out["Volume"] = 0
-
-    out = out.sort_index()
-    return out
+def md_candles(symbol: str, resolution: str, countback: int = 120) -> pd.DataFrame:
+    url = f"{BASE_URL}/stocks/candles/{resolution}/{symbol}/"
+    params = {
+        "countback": countback,
+        "format": "json",
+    }
+    data = md_get_with_retry(url, params=params)
+    return build_candles_df(data)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_price_history(symbol: str, period: str, interval: str) -> pd.DataFrame:
-    ticker = yf.Ticker(symbol)
-    df = ticker.history(period=period, interval=interval, auto_adjust=False, actions=False)
-    return normalize_columns(df)
+def fetch_core_data(symbol: str):
+    daily_df = md_candles(symbol, "D", countback=180)
+    hourly_df = md_candles(symbol, "60", countback=180)
+    intraday_df = md_candles(symbol, "15", countback=180)
+    return daily_df, hourly_df, intraday_df
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_options_chain(symbol: str):
-    ticker = yf.Ticker(symbol)
-    expirations = list(ticker.options)
-    chains = {}
-    for exp in expirations[:8]:  # keep it light
-        try:
-            chain = ticker.option_chain(exp)
-            calls = chain.calls.copy()
-            puts = chain.puts.copy()
-            chains[exp] = {"calls": calls, "puts": puts}
-        except Exception:
-            continue
-    return expirations, chains
+def md_expirations(symbol: str) -> list[str]:
+    url = f"{BASE_URL}/options/expirations/{symbol}/"
+    params = {"format": "json"}
+    data = md_get_with_retry(url, params=params)
+
+    exps = data.get("expirations", [])
+    if not exps and "expiration" in data:
+        exps = data.get("expiration", [])
+
+    return sorted([str(x) for x in exps])
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def md_filtered_chain(
+    symbol: str,
+    expiration: str,
+    side: str,
+    strike_low: float,
+    strike_high: float,
+):
+    url = f"{BASE_URL}/options/chain/{symbol}/"
+    params = {
+        "expiration": expiration,
+        "side": side,
+        "strike": f"{strike_low}-{strike_high}",
+        "strikeLimit": 12,
+        "minOpenInterest": 50,
+        "minVolume": 1,
+        "format": "json",
+    }
+    return md_get_with_retry(url, params=params)
+
+
+def chain_json_to_df(data: dict) -> pd.DataFrame:
+    if not data:
+        return pd.DataFrame()
+
+    if "s" in data and isinstance(data["s"], list):
+        return pd.DataFrame(data["s"])
+
+    keys = [
+        "symbol",
+        "underlying",
+        "expiration",
+        "side",
+        "strike",
+        "bid",
+        "ask",
+        "mid",
+        "last",
+        "delta",
+        "gamma",
+        "theta",
+        "vega",
+        "iv",
+        "openInterest",
+        "volume",
+    ]
+
+    length = 0
+    for k in data.keys():
+        if isinstance(data[k], list):
+            length = max(length, len(data[k]))
+
+    if length == 0:
+        return pd.DataFrame()
+
+    out = {}
+    for key in keys:
+        val = data.get(key, [])
+        if isinstance(val, list) and len(val) == length:
+            out[key] = val
+
+    df = pd.DataFrame(out)
+    return df
+
+
+# =========================================================
+# TECHNICALS
+# =========================================================
 def add_ema(df: pd.DataFrame, span: int, col_name: str) -> pd.DataFrame:
+    df = df.copy()
     df[col_name] = df["Close"].ewm(span=span, adjust=False).mean()
     return df
 
 
 def add_atr(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    df = df.copy()
     prev_close = df["Close"].shift(1)
     tr1 = df["High"] - df["Low"]
     tr2 = (df["High"] - prev_close).abs()
@@ -127,17 +253,19 @@ def add_atr(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
 
 
 def add_volume_metrics(df: pd.DataFrame, vol_period: int = 20, spike_threshold: float = 1.5) -> pd.DataFrame:
+    df = df.copy()
     df["vol_ma"] = df["Volume"].rolling(vol_period).mean()
-    df["vol_ratio"] = np.where(df["vol_ma"] > 0, df["Volume"] / df["vol_ma"], np.nan)
+    df["vol_ratio"] = df["Volume"] / df["vol_ma"]
     df["volume_spike"] = df["vol_ratio"] > spike_threshold
     return df
 
 
 def get_trend_from_emas(df: pd.DataFrame, fast: int = 20, slow: int = 50) -> str:
-    if df.empty or len(df) < max(fast, slow) + 5:
+    if df.empty or len(df) < slow + 5:
         return "neutral"
     ema_fast = df["Close"].ewm(span=fast, adjust=False).mean()
     ema_slow = df["Close"].ewm(span=slow, adjust=False).mean()
+
     if ema_fast.iloc[-1] > ema_slow.iloc[-1]:
         return "bullish"
     if ema_fast.iloc[-1] < ema_slow.iloc[-1]:
@@ -156,6 +284,7 @@ def multi_timeframe_trend(daily_df: pd.DataFrame, hourly_df: pd.DataFrame, intra
 
     aligned = "neutral"
     alignment_score = 0
+
     if bulls >= 2:
         aligned = "bullish"
         alignment_score = bulls
@@ -174,21 +303,25 @@ def multi_timeframe_trend(daily_df: pd.DataFrame, hourly_df: pd.DataFrame, intra
 
 def get_levels(df: pd.DataFrame, lookback: int = 20):
     if len(df) < lookback + 2:
-        return np.nan, np.nan
+        return None, None
     recent = df.iloc[-lookback - 1:-1]
     support = recent["Low"].min()
     resistance = recent["High"].max()
     return float(support), float(resistance)
 
 
-def detect_sweep(df: pd.DataFrame, support: float, resistance: float):
-    if df.empty or pd.isna(support) or pd.isna(resistance):
+def detect_sweep(df: pd.DataFrame, support: float | None, resistance: float | None):
+    if df.empty or support is None or resistance is None:
         return None
+
     last = df.iloc[-1]
+
     if last["Low"] < support and last["Close"] > support:
         return "bullish_sweep"
+
     if last["High"] > resistance and last["Close"] < resistance:
         return "bearish_sweep"
+
     return None
 
 
@@ -213,6 +346,9 @@ def rejection_strength(df: pd.DataFrame) -> str:
     return "weak"
 
 
+# =========================================================
+# DO-NOT-TRADE WINDOWS
+# =========================================================
 def build_no_trade_windows(
     avoid_open_minutes: int,
     avoid_close_minutes: int,
@@ -223,54 +359,222 @@ def build_no_trade_windows(
 ):
     windows = []
 
-    # Regular cash session assumptions for US equities/ETFs
     market_open = time(9, 30)
     market_close = time(16, 0)
 
-    open_end_minutes = 30 + avoid_open_minutes
-    open_end_hour = 9 + (open_end_minutes // 60)
-    open_end_min = open_end_minutes % 60
-    open_end = time(open_end_hour, open_end_min)
-
-    close_start_total = (16 * 60) - avoid_close_minutes
-    close_start = time(close_start_total // 60, close_start_total % 60)
-
     if avoid_open_minutes > 0:
-        windows.append(("Open volatility window", market_open, open_end))
+        end_minutes = (9 * 60 + 30) + avoid_open_minutes
+        windows.append(
+            (
+                "Open volatility window",
+                market_open,
+                time(end_minutes // 60, end_minutes % 60),
+            )
+        )
+
     if avoid_close_minutes > 0:
-        windows.append(("Close volatility window", close_start, market_close))
+        start_minutes = (16 * 60) - avoid_close_minutes
+        windows.append(
+            (
+                "Close volatility window",
+                time(start_minutes // 60, start_minutes % 60),
+                market_close,
+            )
+        )
+
     if use_lunch_window:
         windows.append(("Lunch drift window", lunch_start, lunch_end))
 
     return windows, use_midday_friday
 
 
-def is_in_no_trade_window(
-    ts: datetime,
-    windows,
-    use_midday_friday: bool,
-) -> tuple[bool, str]:
+def is_in_no_trade_window(ts: datetime, windows, use_midday_friday: bool) -> tuple[bool, str]:
     local_ts = ts.astimezone(APP_TZ)
-    t = local_ts.time()
-    weekday = local_ts.weekday()  # Mon=0 ... Fri=4
+    current_time = local_ts.time()
+    weekday = local_ts.weekday()
 
     for label, start_t, end_t in windows:
-        if start_t <= t <= end_t:
+        if start_t <= current_time <= end_t:
             return True, label
 
-    if use_midday_friday and weekday == 4 and time(12, 0) <= t <= time(13, 30):
+    if use_midday_friday and weekday == 4 and time(12, 0) <= current_time <= time(13, 30):
         return True, "Friday midday chop window"
 
     return False, ""
 
 
-def suggest_spread(
-    df: pd.DataFrame,
-    sweep: str | None,
-    strike_width: float,
-    atr_mult: float,
-    strike_increment: float,
-):
+# =========================================================
+# STRATEGY LOGIC
+# =========================================================
+def get_auto_direction(result: dict) -> str:
+    sweep = result.get("sweep")
+    mtf = result.get("mtf", {}).get("aligned", "neutral")
+
+    if sweep == "bullish_sweep" and mtf == "bullish":
+        return "bullish"
+    if sweep == "bearish_sweep" and mtf == "bearish":
+        return "bearish"
+    return "neutral"
+
+
+def strategy_profile(strategy_choice: str, auto_direction: str | None = None):
+    if strategy_choice == "Auto":
+        if auto_direction == "bullish":
+            return {
+                "strategy": "Put Credit Spread",
+                "side": "put",
+                "structure": "credit",
+                "direction": "bullish",
+            }
+        if auto_direction == "bearish":
+            return {
+                "strategy": "Call Credit Spread",
+                "side": "call",
+                "structure": "credit",
+                "direction": "bearish",
+            }
+        return {
+            "strategy": "Iron Condor",
+            "side": "both",
+            "structure": "credit",
+            "direction": "neutral",
+        }
+
+    mapping = {
+        "Put Credit Spread": {
+            "strategy": "Put Credit Spread",
+            "side": "put",
+            "structure": "credit",
+            "direction": "bullish",
+        },
+        "Call Credit Spread": {
+            "strategy": "Call Credit Spread",
+            "side": "call",
+            "structure": "credit",
+            "direction": "bearish",
+        },
+        "Iron Condor": {
+            "strategy": "Iron Condor",
+            "side": "both",
+            "structure": "credit",
+            "direction": "neutral",
+        },
+        "Put Debit Spread": {
+            "strategy": "Put Debit Spread",
+            "side": "put",
+            "structure": "debit",
+            "direction": "bearish",
+        },
+        "Call Debit Spread": {
+            "strategy": "Call Debit Spread",
+            "side": "call",
+            "structure": "debit",
+            "direction": "bullish",
+        },
+        "Cash Secured Put": {
+            "strategy": "Cash Secured Put",
+            "side": "put",
+            "structure": "short_single",
+            "direction": "bullish",
+        },
+        "Covered Call": {
+            "strategy": "Covered Call",
+            "side": "call",
+            "structure": "short_single",
+            "direction": "neutral_bullish",
+        },
+    }
+
+    return mapping[strategy_choice]
+
+
+def suggest_trade_levels(result: dict, profile: dict, spot: float, width: float, atr_mult: float, strike_increment: float):
+    atr = result.get("atr")
+    support = result.get("support")
+    resistance = result.get("resistance")
+    spread = result.get("spread")
+
+    if atr is None:
+        return None
+
+    if profile["strategy"] == "Put Credit Spread":
+        if spread and spread.get("type") == "put_credit":
+            short_strike = spread["short_strike"]
+            long_strike = spread["long_strike"]
+        else:
+            short_strike = round_to_increment(support - atr * atr_mult, strike_increment)
+            long_strike = round_to_increment(short_strike - width, strike_increment)
+
+        return {
+            "option_side": "put",
+            "short_strike": short_strike,
+            "long_strike": long_strike,
+        }
+
+    if profile["strategy"] == "Call Credit Spread":
+        if spread and spread.get("type") == "call_credit":
+            short_strike = spread["short_strike"]
+            long_strike = spread["long_strike"]
+        else:
+            short_strike = round_to_increment(resistance + atr * atr_mult, strike_increment)
+            long_strike = round_to_increment(short_strike + width, strike_increment)
+
+        return {
+            "option_side": "call",
+            "short_strike": short_strike,
+            "long_strike": long_strike,
+        }
+
+    if profile["strategy"] == "Put Debit Spread":
+        long_strike = round_to_increment(spot, strike_increment)
+        short_strike = round_to_increment(long_strike - width, strike_increment)
+        return {
+            "option_side": "put",
+            "long_strike": long_strike,
+            "short_strike": short_strike,
+        }
+
+    if profile["strategy"] == "Call Debit Spread":
+        long_strike = round_to_increment(spot, strike_increment)
+        short_strike = round_to_increment(long_strike + width, strike_increment)
+        return {
+            "option_side": "call",
+            "long_strike": long_strike,
+            "short_strike": short_strike,
+        }
+
+    if profile["strategy"] == "Cash Secured Put":
+        short_strike = round_to_increment(support - atr * atr_mult, strike_increment)
+        return {
+            "option_side": "put",
+            "short_strike": short_strike,
+        }
+
+    if profile["strategy"] == "Covered Call":
+        short_strike = round_to_increment(resistance + atr * atr_mult, strike_increment)
+        return {
+            "option_side": "call",
+            "short_strike": short_strike,
+        }
+
+    if profile["strategy"] == "Iron Condor":
+        put_short = round_to_increment(support - atr * atr_mult, strike_increment)
+        put_long = round_to_increment(put_short - width, strike_increment)
+        call_short = round_to_increment(resistance + atr * atr_mult, strike_increment)
+        call_long = round_to_increment(call_short + width, strike_increment)
+
+        return {
+            "option_side": "both",
+            "put_short": put_short,
+            "put_long": put_long,
+            "call_short": call_short,
+            "call_long": call_long,
+        }
+
+    return None
+
+
+def suggest_base_spread(df: pd.DataFrame, sweep: str | None, strike_width: float, atr_mult: float, strike_increment: float):
     if df.empty or sweep is None:
         return None
 
@@ -283,8 +587,6 @@ def suggest_spread(
         anchor = float(last["Low"]) - (atr * atr_mult)
         short_strike = round_to_increment(anchor, strike_increment)
         long_strike = round_to_increment(short_strike - strike_width, strike_increment)
-        if long_strike >= short_strike:
-            long_strike = round_to_increment(short_strike - strike_increment, strike_increment)
         return {
             "type": "put_credit",
             "anchor_price": round(anchor, 2),
@@ -296,8 +598,6 @@ def suggest_spread(
         anchor = float(last["High"]) + (atr * atr_mult)
         short_strike = round_to_increment(anchor, strike_increment)
         long_strike = round_to_increment(short_strike + strike_width, strike_increment)
-        if long_strike <= short_strike:
-            long_strike = round_to_increment(short_strike + strike_increment, strike_increment)
         return {
             "type": "call_credit",
             "anchor_price": round(anchor, 2),
@@ -380,78 +680,6 @@ def apply_manual_trend_override(mtf: dict, override: str) -> dict:
     return out
 
 
-def choose_expiration(expirations: list[str], min_dte_days: int = 7, max_dte_days: int = 21):
-    if not expirations:
-        return None
-    today = now_et().date()
-    candidates = []
-    for exp in expirations:
-        try:
-            d = pd.to_datetime(exp).date()
-            dte = (d - today).days
-            if min_dte_days <= dte <= max_dte_days:
-                candidates.append((dte, exp))
-        except Exception:
-            continue
-    if candidates:
-        candidates.sort(key=lambda x: abs(x[0] - 14))
-        return candidates[0][1]
-    return expirations[0]
-
-
-def find_option_idea_for_spread(symbol: str, spread: dict, expirations, chains):
-    if not spread or not expirations or not chains:
-        return None
-
-    selected_exp = choose_expiration(expirations)
-    if not selected_exp or selected_exp not in chains:
-        return None
-
-    side = "puts" if spread["type"] == "put_credit" else "calls"
-    chain_df = chains[selected_exp][side].copy()
-
-    if chain_df.empty or "strike" not in chain_df.columns:
-        return None
-
-    short_strike = spread["short_strike"]
-    long_strike = spread["long_strike"]
-
-    short_row = chain_df.loc[(chain_df["strike"] - short_strike).abs().idxmin()] if not chain_df.empty else None
-    long_row = chain_df.loc[(chain_df["strike"] - long_strike).abs().idxmin()] if not chain_df.empty else None
-
-    if short_row is None or long_row is None:
-        return None
-
-    short_mid = np.nanmean([short_row.get("bid", np.nan), short_row.get("ask", np.nan)])
-    long_mid = np.nanmean([long_row.get("bid", np.nan), long_row.get("ask", np.nan)])
-    est_credit = safe_float(short_mid, 0.0) - safe_float(long_mid, 0.0)
-    width = abs(float(short_row["strike"]) - float(long_row["strike"]))
-    max_loss = max(width - est_credit, 0.0) if est_credit is not None else None
-
-    return {
-        "expiration": selected_exp,
-        "short_leg": {
-            "strike": safe_float(short_row.get("strike")),
-            "bid": safe_float(short_row.get("bid")),
-            "ask": safe_float(short_row.get("ask")),
-            "iv": safe_float(short_row.get("impliedVolatility")),
-            "oi": safe_float(short_row.get("openInterest")),
-            "volume": safe_float(short_row.get("volume")),
-        },
-        "long_leg": {
-            "strike": safe_float(long_row.get("strike")),
-            "bid": safe_float(long_row.get("bid")),
-            "ask": safe_float(long_row.get("ask")),
-            "iv": safe_float(long_row.get("impliedVolatility")),
-            "oi": safe_float(long_row.get("openInterest")),
-            "volume": safe_float(long_row.get("volume")),
-        },
-        "est_credit": round(est_credit, 2) if est_credit is not None and not pd.isna(est_credit) else None,
-        "width": round(width, 2),
-        "est_max_loss": round(max_loss, 2) if max_loss is not None else None,
-    }
-
-
 def analyze_setup(
     symbol: str,
     daily_df: pd.DataFrame,
@@ -497,7 +725,7 @@ def analyze_setup(
 
     spread = None
     if is_valid:
-        spread = suggest_spread(
+        spread = suggest_base_spread(
             intraday_df,
             sweep=sweep,
             strike_width=strike_width,
@@ -517,8 +745,8 @@ def analyze_setup(
         "symbol": symbol.upper(),
         "spot": round(float(last["Close"]), 2),
         "last_bar_time": last_bar_ts.astimezone(APP_TZ),
-        "support": round(support, 2) if not pd.isna(support) else None,
-        "resistance": round(resistance, 2) if not pd.isna(resistance) else None,
+        "support": round(support, 2) if support is not None else None,
+        "resistance": round(resistance, 2) if resistance is not None else None,
         "sweep": sweep,
         "rejection": rejection,
         "volume_spike": volume_spike,
@@ -535,17 +763,247 @@ def analyze_setup(
     }
 
 
-# -----------------------------
-# Sidebar
-# -----------------------------
-st.sidebar.header("Settings")
+# =========================================================
+# OPTION PICKING
+# =========================================================
+def choose_expiration(expirations: list[str], target_dte: int = 14) -> str | None:
+    if not expirations:
+        return None
+
+    today = now_et().date()
+    candidates = []
+
+    for exp in expirations:
+        try:
+            exp_date = pd.to_datetime(exp).date()
+            dte = (exp_date - today).days
+            if dte >= 1:
+                candidates.append((abs(dte - target_dte), dte, exp))
+        except Exception:
+            continue
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    return candidates[0][2]
+
+
+def get_target_dte(expiration_mode: str) -> int:
+    mapping = {
+        "Auto": 14,
+        "Nearest Weekly": 7,
+        "14 DTE": 14,
+        "30 DTE": 30,
+    }
+    return mapping.get(expiration_mode, 14)
+
+
+def match_nearest_strike(df: pd.DataFrame, strike_value: float):
+    if df.empty or "strike" not in df.columns:
+        return None
+    work = df.copy()
+    work["dist"] = (work["strike"].astype(float) - float(strike_value)).abs()
+    return work.sort_values("dist").iloc[0].to_dict()
+
+
+def fetch_strategy_options(symbol: str, expiration: str, profile: dict, levels: dict):
+    if not expiration or not levels:
+        return {}
+
+    result = {}
+
+    if profile["side"] == "put":
+        low = min(levels.get("short_strike", levels.get("long_strike")), levels.get("long_strike", levels.get("short_strike"))) - 10
+        high = max(levels.get("short_strike", levels.get("long_strike")), levels.get("long_strike", levels.get("short_strike"))) + 10
+        result["puts"] = chain_json_to_df(md_filtered_chain(symbol, expiration, "put", low, high))
+
+    elif profile["side"] == "call":
+        low = min(levels.get("short_strike", levels.get("long_strike")), levels.get("long_strike", levels.get("short_strike"))) - 10
+        high = max(levels.get("short_strike", levels.get("long_strike")), levels.get("long_strike", levels.get("short_strike"))) + 10
+        result["calls"] = chain_json_to_df(md_filtered_chain(symbol, expiration, "call", low, high))
+
+    elif profile["side"] == "both":
+        put_low = min(levels["put_short"], levels["put_long"]) - 10
+        put_high = max(levels["put_short"], levels["put_long"]) + 10
+        call_low = min(levels["call_short"], levels["call_long"]) - 10
+        call_high = max(levels["call_short"], levels["call_long"]) + 10
+
+        result["puts"] = chain_json_to_df(md_filtered_chain(symbol, expiration, "put", put_low, put_high))
+        result["calls"] = chain_json_to_df(md_filtered_chain(symbol, expiration, "call", call_low, call_high))
+
+    return result
+
+
+def build_trade_from_chain(profile: dict, levels: dict, options_data: dict):
+    if not levels or not options_data:
+        return None
+
+    if profile["strategy"] in {"Put Credit Spread", "Put Debit Spread"}:
+        puts = options_data.get("puts", pd.DataFrame())
+        if puts.empty:
+            return None
+
+        short_leg = match_nearest_strike(puts, levels["short_strike"])
+        long_leg = match_nearest_strike(puts, levels["long_strike"])
+
+        if not short_leg or not long_leg:
+            return None
+
+        short_mid = safe_float(short_leg.get("mid"), 0.0)
+        long_mid = safe_float(long_leg.get("mid"), 0.0)
+
+        if profile["structure"] == "credit":
+            est_value = round(short_mid - long_mid, 2)
+        else:
+            est_value = round(long_mid - short_mid, 2)
+
+        width = abs(float(short_leg["strike"]) - float(long_leg["strike"]))
+        max_loss = round(width - est_value, 2) if profile["structure"] == "credit" else round(est_value, 2)
+
+        return {
+            "strategy": profile["strategy"],
+            "expiration": short_leg.get("expiration"),
+            "short_leg": short_leg,
+            "long_leg": long_leg,
+            "estimated_value": est_value,
+            "width": round(width, 2),
+            "estimated_max_loss": max_loss,
+        }
+
+    if profile["strategy"] in {"Call Credit Spread", "Call Debit Spread"}:
+        calls = options_data.get("calls", pd.DataFrame())
+        if calls.empty:
+            return None
+
+        short_leg = match_nearest_strike(calls, levels["short_strike"])
+        long_leg = match_nearest_strike(calls, levels["long_strike"])
+
+        if not short_leg or not long_leg:
+            return None
+
+        short_mid = safe_float(short_leg.get("mid"), 0.0)
+        long_mid = safe_float(long_leg.get("mid"), 0.0)
+
+        if profile["structure"] == "credit":
+            est_value = round(short_mid - long_mid, 2)
+        else:
+            est_value = round(long_mid - short_mid, 2)
+
+        width = abs(float(short_leg["strike"]) - float(long_leg["strike"]))
+        max_loss = round(width - est_value, 2) if profile["structure"] == "credit" else round(est_value, 2)
+
+        return {
+            "strategy": profile["strategy"],
+            "expiration": short_leg.get("expiration"),
+            "short_leg": short_leg,
+            "long_leg": long_leg,
+            "estimated_value": est_value,
+            "width": round(width, 2),
+            "estimated_max_loss": max_loss,
+        }
+
+    if profile["strategy"] == "Cash Secured Put":
+        puts = options_data.get("puts", pd.DataFrame())
+        if puts.empty:
+            return None
+
+        short_leg = match_nearest_strike(puts, levels["short_strike"])
+        if not short_leg:
+            return None
+
+        return {
+            "strategy": profile["strategy"],
+            "expiration": short_leg.get("expiration"),
+            "short_leg": short_leg,
+            "estimated_value": safe_float(short_leg.get("mid")),
+        }
+
+    if profile["strategy"] == "Covered Call":
+        calls = options_data.get("calls", pd.DataFrame())
+        if calls.empty:
+            return None
+
+        short_leg = match_nearest_strike(calls, levels["short_strike"])
+        if not short_leg:
+            return None
+
+        return {
+            "strategy": profile["strategy"],
+            "expiration": short_leg.get("expiration"),
+            "short_leg": short_leg,
+            "estimated_value": safe_float(short_leg.get("mid")),
+        }
+
+    if profile["strategy"] == "Iron Condor":
+        puts = options_data.get("puts", pd.DataFrame())
+        calls = options_data.get("calls", pd.DataFrame())
+        if puts.empty or calls.empty:
+            return None
+
+        put_short = match_nearest_strike(puts, levels["put_short"])
+        put_long = match_nearest_strike(puts, levels["put_long"])
+        call_short = match_nearest_strike(calls, levels["call_short"])
+        call_long = match_nearest_strike(calls, levels["call_long"])
+
+        if not all([put_short, put_long, call_short, call_long]):
+            return None
+
+        put_credit = safe_float(put_short.get("mid"), 0.0) - safe_float(put_long.get("mid"), 0.0)
+        call_credit = safe_float(call_short.get("mid"), 0.0) - safe_float(call_long.get("mid"), 0.0)
+        total_credit = round(put_credit + call_credit, 2)
+
+        put_width = abs(float(put_short["strike"]) - float(put_long["strike"]))
+        call_width = abs(float(call_short["strike"]) - float(call_long["strike"]))
+        max_width = max(put_width, call_width)
+        max_loss = round(max_width - total_credit, 2)
+
+        return {
+            "strategy": profile["strategy"],
+            "expiration": put_short.get("expiration"),
+            "put_short": put_short,
+            "put_long": put_long,
+            "call_short": call_short,
+            "call_long": call_long,
+            "estimated_value": total_credit,
+            "width": round(max_width, 2),
+            "estimated_max_loss": max_loss,
+        }
+
+    return None
+
+
+# =========================================================
+# SIDEBAR
+# =========================================================
+st.sidebar.header("Controls")
 
 symbol = st.sidebar.text_input("Ticker", value="SPY").upper().strip()
-manual_refresh = st.sidebar.button("Refresh data")
+
+strategy_choice = st.sidebar.selectbox(
+    "Strategy",
+    [
+        "Auto",
+        "Put Credit Spread",
+        "Call Credit Spread",
+        "Iron Condor",
+        "Put Debit Spread",
+        "Call Debit Spread",
+        "Cash Secured Put",
+        "Covered Call",
+    ],
+    index=0,
+)
+
+expiration_mode = st.sidebar.selectbox(
+    "Expiration Selection",
+    ["Auto", "Nearest Weekly", "14 DTE", "30 DTE"],
+    index=0,
+)
 
 manual_trend_override = st.sidebar.selectbox(
     "Trend override",
-    options=["auto", "bullish", "bearish", "neutral"],
+    ["auto", "bullish", "bearish", "neutral"],
     index=0,
 )
 
@@ -553,91 +1011,109 @@ lookback = st.sidebar.slider("Sweep lookback bars", 10, 60, 20)
 atr_period = st.sidebar.slider("ATR period", 5, 30, 14)
 vol_period = st.sidebar.slider("Volume MA period", 5, 40, 20)
 vol_spike_threshold = st.sidebar.slider("Volume spike threshold", 1.0, 3.0, 1.5, 0.1)
+atr_mult = st.sidebar.slider("ATR multiplier", 0.25, 2.0, 0.75, 0.05)
 
-default_strike_increment = infer_strike_increment(100)
-strike_increment = st.sidebar.selectbox(
-    "Strike increment",
-    options=[0.5, 1.0, 2.5, 5.0],
-    index=[0.5, 1.0, 2.5, 5.0].index(default_strike_increment if default_strike_increment in [0.5, 1.0, 2.5, 5.0] else 1.0),
-)
+default_increment = 1.0
+strike_increment = st.sidebar.selectbox("Strike increment", [0.5, 1.0, 2.5, 5.0], index=1)
+spread_width = st.sidebar.number_input("Spread width", min_value=float(strike_increment), value=5.0, step=float(strike_increment))
 
-strike_width = st.sidebar.number_input("Spread width", min_value=float(strike_increment), value=5.0, step=float(strike_increment))
-atr_mult = st.sidebar.slider("ATR buffer multiplier", 0.25, 2.0, 0.75, 0.05)
-
-st.sidebar.subheader("Do-not-trade windows")
+st.sidebar.subheader("Do-Not-Trade Windows")
 avoid_open_minutes = st.sidebar.slider("Avoid after open (minutes)", 0, 90, 15)
 avoid_close_minutes = st.sidebar.slider("Avoid before close (minutes)", 0, 120, 60)
-use_lunch_window = st.sidebar.checkbox("Block lunch drift window", value=False)
+use_lunch_window = st.sidebar.checkbox("Block lunch window", value=False)
 lunch_start_h = st.sidebar.number_input("Lunch start hour", min_value=10, max_value=14, value=12)
 lunch_start_m = st.sidebar.number_input("Lunch start minute", min_value=0, max_value=59, value=0)
 lunch_end_h = st.sidebar.number_input("Lunch end hour", min_value=10, max_value=15, value=13)
 lunch_end_m = st.sidebar.number_input("Lunch end minute", min_value=0, max_value=59, value=0)
 use_midday_friday = st.sidebar.checkbox("Block Friday midday", value=True)
 
-show_options_idea = st.sidebar.checkbox("Try options-chain idea lookup", value=True)
+st.sidebar.subheader("Run")
+analyze_clicked = st.sidebar.button("Analyze")
+load_options_clicked = st.sidebar.button("Load Options For Selected Strategy")
 
-
-# -----------------------------
-# Refresh cache
-# -----------------------------
-if manual_refresh:
+if st.sidebar.button("Clear Cached Data"):
     st.cache_data.clear()
+    st.session_state.pop("analysis_result", None)
+    st.session_state.pop("selected_levels", None)
+    st.session_state.pop("selected_profile", None)
+    st.session_state.pop("selected_expiration", None)
+    st.session_state.pop("trade_result", None)
+    st.success("Cache cleared.")
 
 
-# -----------------------------
-# Load data
-# -----------------------------
-try:
-    daily_df = fetch_price_history(symbol, period="1y", interval="1d")
-    hourly_df = fetch_price_history(symbol, period="60d", interval="60m")
-    intraday_df = fetch_price_history(symbol, period="30d", interval="15m")
-except Exception as e:
-    st.error(f"Failed to load price history for {symbol}: {e}")
-    st.stop()
-
-if daily_df.empty or hourly_df.empty or intraday_df.empty:
-    st.error("Not enough data returned. Try another symbol.")
-    st.stop()
-
-
-# -----------------------------
-# Build windows + analyze
-# -----------------------------
-lunch_start = time(int(lunch_start_h), int(lunch_start_m))
-lunch_end = time(int(lunch_end_h), int(lunch_end_m))
-
-windows, friday_midday_block = build_no_trade_windows(
-    avoid_open_minutes=avoid_open_minutes,
-    avoid_close_minutes=avoid_close_minutes,
-    lunch_start=lunch_start,
-    lunch_end=lunch_end,
-    use_lunch_window=use_lunch_window,
-    use_midday_friday=use_midday_friday,
-)
-
-result = analyze_setup(
-    symbol=symbol,
-    daily_df=daily_df,
-    hourly_df=hourly_df,
-    intraday_df=intraday_df,
-    lookback=lookback,
-    atr_period=atr_period,
-    vol_period=vol_period,
-    vol_spike_threshold=vol_spike_threshold,
-    strike_width=strike_width,
-    atr_mult=atr_mult,
-    strike_increment=strike_increment,
-    manual_trend_override=manual_trend_override,
-    no_trade_windows=windows,
-    friday_midday_block=friday_midday_block,
-)
-
-# -----------------------------
-# Top dashboard
-# -----------------------------
-st.title("Liquidity Sweep Spread Finder")
+# =========================================================
+# MAIN FLOW
+# =========================================================
+st.title("Low-Call MarketData Spread Finder")
 st.caption(f"Time now: {now_et().strftime('%Y-%m-%d %I:%M:%S %p ET')}")
 
+if analyze_clicked:
+    try:
+        daily_df, hourly_df, intraday_df = fetch_core_data(symbol)
+
+        lunch_start = time(int(lunch_start_h), int(lunch_start_m))
+        lunch_end = time(int(lunch_end_h), int(lunch_end_m))
+        windows, friday_midday_block = build_no_trade_windows(
+            avoid_open_minutes=avoid_open_minutes,
+            avoid_close_minutes=avoid_close_minutes,
+            lunch_start=lunch_start,
+            lunch_end=lunch_end,
+            use_lunch_window=use_lunch_window,
+            use_midday_friday=use_midday_friday,
+        )
+
+        result = analyze_setup(
+            symbol=symbol,
+            daily_df=daily_df,
+            hourly_df=hourly_df,
+            intraday_df=intraday_df,
+            lookback=lookback,
+            atr_period=atr_period,
+            vol_period=vol_period,
+            vol_spike_threshold=vol_spike_threshold,
+            strike_width=spread_width,
+            atr_mult=atr_mult,
+            strike_increment=strike_increment,
+            manual_trend_override=manual_trend_override,
+            no_trade_windows=windows,
+            friday_midday_block=friday_midday_block,
+        )
+
+        auto_direction = get_auto_direction(result)
+        profile = strategy_profile(strategy_choice, auto_direction)
+        levels = suggest_trade_levels(
+            result=result,
+            profile=profile,
+            spot=result["spot"],
+            width=spread_width,
+            atr_mult=atr_mult,
+            strike_increment=strike_increment,
+        )
+
+        expirations = md_expirations(symbol)
+        selected_expiration = choose_expiration(expirations, get_target_dte(expiration_mode))
+
+        st.session_state["analysis_result"] = result
+        st.session_state["selected_profile"] = profile
+        st.session_state["selected_levels"] = levels
+        st.session_state["selected_expiration"] = selected_expiration
+        st.session_state["trade_result"] = None
+
+    except Exception as e:
+        st.error(f"Analyze failed: {e}")
+
+if "analysis_result" not in st.session_state:
+    st.info("Press Analyze to load price data and generate strategy levels.")
+    st.stop()
+
+result = st.session_state["analysis_result"]
+profile = st.session_state["selected_profile"]
+levels = st.session_state["selected_levels"]
+selected_expiration = st.session_state["selected_expiration"]
+
+# =========================================================
+# DASHBOARD
+# =========================================================
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Ticker", result["symbol"])
 c2.metric("Spot", f'{result["spot"]:.2f}')
@@ -649,7 +1125,7 @@ c6, c7, c8, c9 = st.columns(4)
 c6.metric("Support", f'{result["support"]:.2f}' if result["support"] else "N/A")
 c7.metric("Resistance", f'{result["resistance"]:.2f}' if result["resistance"] else "N/A")
 c8.metric("Rejection", result["rejection"].title())
-c9.metric("Volume spike", "Yes" if result["volume_spike"] else "No")
+c9.metric("Volume Spike", "Yes" if result["volume_spike"] else "No")
 
 if result["in_no_trade_window"]:
     st.warning(f"Do not trade right now: {result['reason']}")
@@ -658,10 +1134,6 @@ elif result["is_valid"]:
 else:
     st.info(result["reason"])
 
-
-# -----------------------------
-# Trend alignment
-# -----------------------------
 st.subheader("Trend Alignment")
 mtf = result["mtf"]
 st.write(
@@ -672,71 +1144,89 @@ st.write(
 )
 
 if mtf.get("manual_override"):
-    st.caption("Manual trend override is active.")
+    st.caption("Manual trend override active.")
 
+st.subheader("Selected Strategy")
+st.write(f"**Strategy:** {profile['strategy']}")
+st.write(f"**Direction Bias:** {profile['direction']}")
+st.write(f"**Chosen Expiration:** {selected_expiration or 'None found'}")
 
-# -----------------------------
-# Spread idea
-# -----------------------------
-st.subheader("Spread Suggestion")
-
-spread = result["spread"]
-if spread:
-    st.write(
-        f"**Trade Type:** {spread['type']}  \n"
-        f"**Anchor Price:** {spread['anchor_price']:.2f}  \n"
-        f"**Short Strike:** {spread['short_strike']:.2f}  \n"
-        f"**Long Strike:** {spread['long_strike']:.2f}"
-    )
+st.subheader("Suggested Levels")
+if levels:
+    st.json(levels)
 else:
-    st.write("No valid spread suggestion right now.")
+    st.warning("Could not build levels for this strategy with the current data.")
 
-
-# -----------------------------
-# Options-chain idea lookup
-# -----------------------------
-if show_options_idea and spread:
+# =========================================================
+# OPTIONS LOAD
+# =========================================================
+if load_options_clicked:
     try:
-        expirations, chains = fetch_options_chain(symbol)
-        idea = find_option_idea_for_spread(symbol, spread, expirations, chains)
+        if not selected_expiration:
+            st.error("No expiration available.")
+        elif not levels:
+            st.error("No strategy levels available.")
+        else:
+            options_data = fetch_strategy_options(
+                symbol=symbol,
+                expiration=selected_expiration,
+                profile=profile,
+                levels=levels,
+            )
+            trade_result = build_trade_from_chain(profile, levels, options_data)
+            st.session_state["trade_result"] = trade_result
+    except Exception as e:
+        st.error(f"Options load failed: {e}")
 
-        st.subheader("Options Chain Snapshot")
-        if idea:
-            st.write(
-                f"**Expiration:** {idea['expiration']}  \n"
-                f"**Estimated Credit:** {idea['est_credit'] if idea['est_credit'] is not None else 'N/A'}  \n"
-                f"**Width:** {idea['width']}  \n"
-                f"**Estimated Max Loss:** {idea['est_max_loss'] if idea['est_max_loss'] is not None else 'N/A'}"
+trade_result = st.session_state.get("trade_result")
+
+st.subheader("Options Result")
+if trade_result:
+    if trade_result["strategy"] == "Iron Condor":
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("**Put Side**")
+            st.json(
+                {
+                    "put_short": trade_result["put_short"],
+                    "put_long": trade_result["put_long"],
+                }
+            )
+        with col_b:
+            st.markdown("**Call Side**")
+            st.json(
+                {
+                    "call_short": trade_result["call_short"],
+                    "call_long": trade_result["call_long"],
+                }
             )
 
-            left, right = st.columns(2)
-            with left:
-                st.markdown("**Short leg**")
-                st.json(idea["short_leg"])
-            with right:
-                st.markdown("**Long leg**")
-                st.json(idea["long_leg"])
-        else:
-            st.write("Could not match the suggested spread cleanly to the current options chain.")
-    except Exception as e:
-        st.warning(f"Options chain lookup failed: {e}")
+        st.write(f"**Estimated Credit:** {trade_result['estimated_value']}")
+        st.write(f"**Width:** {trade_result['width']}")
+        st.write(f"**Estimated Max Loss:** {trade_result['estimated_max_loss']}")
 
+    elif trade_result["strategy"] in {"Put Credit Spread", "Call Credit Spread", "Put Debit Spread", "Call Debit Spread"}:
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("**Short Leg**")
+            st.json(trade_result["short_leg"])
+        with col_b:
+            st.markdown("**Long Leg**")
+            st.json(trade_result["long_leg"])
 
-# -----------------------------
-# Do-not-trade windows display
-# -----------------------------
-st.subheader("Active Do-Not-Trade Rules")
-if windows:
-    for label, start_t, end_t in windows:
-        st.write(f"- {label}: {start_t.strftime('%I:%M %p')} to {end_t.strftime('%I:%M %p')} ET")
-if friday_midday_block:
-    st.write("- Friday midday chop window: 12:00 PM to 1:30 PM ET")
+        st.write(f"**Estimated Credit/Debit:** {trade_result['estimated_value']}")
+        st.write(f"**Width:** {trade_result['width']}")
+        st.write(f"**Estimated Max Loss:** {trade_result['estimated_max_loss']}")
 
+    else:
+        st.json(trade_result)
+else:
+    st.info("Press Load Options For Selected Strategy to pull contracts for your chosen setup.")
 
-# -----------------------------
-# Chart data
-# -----------------------------
-st.subheader("Intraday Chart Data")
+# =========================================================
+# CHART / DATA
+# =========================================================
+st.subheader("Intraday Chart")
 chart_df = result["intraday_df"][["Close", "EMA20", "EMA50"]].copy()
 st.line_chart(chart_df)
 
@@ -744,17 +1234,12 @@ with st.expander("Recent intraday bars"):
     display_cols = ["Open", "High", "Low", "Close", "Volume", "ATR", "vol_ratio", "volume_spike", "EMA20", "EMA50"]
     st.dataframe(result["intraday_df"][display_cols].tail(50), use_container_width=True)
 
-
-# -----------------------------
-# Notes
-# -----------------------------
-st.subheader("How to use this")
+st.subheader("How This Saves API Calls")
 st.write(
     """
-- A bullish sweep means price ran below support and reclaimed it.
-- A bearish sweep means price ran above resistance and failed back under it.
-- This app only suggests a spread when sweep + rejection + volume + trend alignment agree,
-  and when the current bar is not inside a blocked trading window.
-- Manual trend override is there in case you want to force the system to match your read.
-    """
+- Price data only loads when you press **Analyze**
+- Options only load when you press **Load Options For Selected Strategy**
+- The app only pulls the side you asked for
+- It does not download full chains on every rerun
+"""
 )
