@@ -1,174 +1,235 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
+import requests
+import yfinance as yf
 from datetime import datetime
 
 st.set_page_config(layout="wide")
 
-# =========================
-# LOAD DATA
-# =========================
-@st.cache_data
-def load_data(ticker):
-    return yf.download(ticker, period="6mo", interval="1d")
+API_KEY = st.secrets["MARKETDATA_API_KEY"]
 
 # =========================
-# LOAD OPTIONS
+# PRICE DATA (LIGHT)
 # =========================
-@st.cache_data
-def load_options(ticker):
-    tk = yf.Ticker(ticker)
-    expirations = tk.options
-    return tk, expirations
-
-def get_option_chain(tk, expiry):
-    chain = tk.option_chain(expiry)
-    calls = chain.calls
-    puts = chain.puts
-    return calls, puts
+@st.cache_data(ttl=300)
+def get_price_data(ticker):
+    return yf.download(ticker, period="3mo", interval="1d")
 
 # =========================
-# TREND
+# MARKETDATA (HEAVY)
+# =========================
+@st.cache_data(ttl=600)
+def get_option_chain(ticker):
+    url = f"https://api.marketdata.app/v1/options/chain/{ticker}/?token={API_KEY}"
+    res = requests.get(url)
+
+    if res.status_code != 200:
+        return None
+
+    df = pd.DataFrame(res.json())
+    return df
+
+# =========================
+# TREND + REGIME
 # =========================
 def get_trend(df):
-    df['ema9'] = df['Close'].ewm(span=9).mean()
-    df['ema21'] = df['Close'].ewm(span=21).mean()
+    df["ema9"] = df["Close"].ewm(span=9).mean()
+    df["ema21"] = df["Close"].ewm(span=21).mean()
+    return "bullish" if df["ema9"].iloc[-1] > df["ema21"].iloc[-1] else "bearish"
 
-    if df['ema9'].iloc[-1] > df['ema21'].iloc[-1]:
-        return "bullish"
-    return "bearish"
-
-# =========================
-# VOL REGIME
-# =========================
 def get_regime(df):
-    move = abs(df['Close'].pct_change().iloc[-1]) * 100
+    move = abs(df["Close"].pct_change().iloc[-1]) * 100
     return "HIGH_VOL" if move > 1.2 else "LOW_VOL"
 
-# =========================
-# DELTA PROXY
-# =========================
-def estimate_delta(price, strike):
-    diff = abs(price - strike) / price
-    return round(max(0.05, 1 - diff * 5), 2)
+def is_range_bound(df):
+    recent = df.tail(10)
+    return (recent["High"].max() - recent["Low"].min()) < (df["High"].rolling(10).mean().iloc[-1] * 1.2)
 
 # =========================
-# FIND STRIKES
+# FILTERS
 # =========================
-def find_strikes(options, price, target="OTM"):
-    options = options.copy()
-    options['distance'] = abs(options['strike'] - price)
+def liquidity_filter(df):
+    df["spread"] = df["ask"] - df["bid"]
+    return df[df["spread"] < 0.3]
 
-    otm = options[options['strike'] > price] if target == "CALL" else options[options['strike'] < price]
-
-    otm = otm.sort_values("distance")
-
-    return otm.head(5)
-
-# =========================
-# BUILD CREDIT SPREAD
-# =========================
-def build_credit_spread(price, calls, puts, trend):
-    if trend == "bullish":
-        candidates = find_strikes(puts, price, "PUT")
-        short = candidates.iloc[1]
-        long = candidates.iloc[3]
-
-        return f"PUT CREDIT → Sell {short['strike']} / Buy {long['strike']}"
-
-    else:
-        candidates = find_strikes(calls, price, "CALL")
-        short = candidates.iloc[1]
-        long = candidates.iloc[3]
-
-        return f"CALL CREDIT → Sell {short['strike']} / Buy {long['strike']}"
+def delta_filter(df, target=0.15, option_type="put"):
+    df = df[df["optionType"] == option_type].copy()
+    df["delta_diff"] = abs(abs(df["delta"]) - target)
+    return df.sort_values("delta_diff").head(10)
 
 # =========================
-# BUILD DEBIT SPREAD
+# POP
 # =========================
-def build_debit_spread(price, calls, puts, trend):
-    if trend == "bullish":
-        candidates = find_strikes(calls, price, "CALL")
-        buy = candidates.iloc[0]
-        sell = candidates.iloc[2]
+def estimate_pop(delta):
+    return round((1 - abs(delta)) * 100, 1)
 
-        return f"CALL DEBIT → Buy {buy['strike']} / Sell {sell['strike']}"
+# =========================
+# STRATEGY ROUTER
+# =========================
+def choose_strategy(trend, regime, df_price):
+    move = abs(df_price["Close"].pct_change().iloc[-1]) * 100
 
-    else:
-        candidates = find_strikes(puts, price, "PUT")
-        buy = candidates.iloc[0]
-        sell = candidates.iloc[2]
+    if move < 0.7:
+        return "CALENDAR"
 
-        return f"PUT DEBIT → Buy {buy['strike']} / Sell {sell['strike']}"
+    if regime == "HIGH_VOL":
+        return "DEBIT"
+
+    if regime == "LOW_VOL":
+        return "CREDIT"
+
+    if trend in ["bullish", "bearish"]:
+        return "LEAPS"
+
+    return "NO_TRADE"
+
+# =========================
+# CREDIT SPREAD
+# =========================
+def build_credit_spread(df, target_delta, width, option_type):
+    candidates = delta_filter(df, target_delta, option_type)
+    trades = []
+
+    for _, short in candidates.iterrows():
+        long_strike = short["strike"] - width if option_type == "put" else short["strike"] + width
+        long = df[(df["strike"] == long_strike) & (df["optionType"] == option_type)]
+
+        if not long.empty:
+            long = long.iloc[0]
+            credit = short["bid"] - long["ask"]
+            risk = width - credit
+            pop = estimate_pop(short["delta"])
+
+            trades.append({
+                "Short": short["strike"],
+                "Long": long["strike"],
+                "Credit": round(credit, 2),
+                "Risk": round(risk, 2),
+                "POP %": pop,
+                "Delta": round(short["delta"], 2)
+            })
+
+    return pd.DataFrame(trades).sort_values("POP %", ascending=False).head(5)
+
+# =========================
+# DEBIT SPREAD
+# =========================
+def build_debit_spread(df, target_delta, width, option_type):
+    candidates = delta_filter(df, target_delta, option_type)
+    trades = []
+
+    for _, buy in candidates.iterrows():
+        sell_strike = buy["strike"] + width if option_type == "call" else buy["strike"] - width
+        sell = df[(df["strike"] == sell_strike) & (df["optionType"] == option_type)]
+
+        if not sell.empty:
+            sell = sell.iloc[0]
+            debit = buy["ask"] - sell["bid"]
+            reward = width - debit
+
+            trades.append({
+                "Buy": buy["strike"],
+                "Sell": sell["strike"],
+                "Debit": round(debit, 2),
+                "Max Profit": round(reward, 2),
+                "Delta": round(buy["delta"], 2)
+            })
+
+    return pd.DataFrame(trades).head(5)
 
 # =========================
 # LEAPS
 # =========================
-def build_leaps(price, calls, puts, trend):
+def build_leaps(df, trend):
+    long_dated = df[df["daysToExpiration"] > 120]
+
     if trend == "bullish":
-        itm = calls[calls['strike'] < price].sort_values("strike", ascending=False)
-        return f"LEAPS CALL → Buy {itm.iloc[0]['strike']} (long-term)"
+        calls = long_dated[long_dated["optionType"] == "call"]
+        return calls.sort_values("delta", ascending=False).head(5)[["strike","delta","ask"]]
 
     else:
-        itm = puts[puts['strike'] > price].sort_values("strike")
-        return f"LEAPS PUT → Buy {itm.iloc[0]['strike']} (long-term)"
+        puts = long_dated[long_dated["optionType"] == "put"]
+        return puts.sort_values("delta").head(5)[["strike","delta","ask"]]
+
+# =========================
+# CALENDAR
+# =========================
+def build_calendar(df, price):
+    near = df[df["daysToExpiration"] < 30]
+    far = df[df["daysToExpiration"] > 60]
+
+    atm = min(df["strike"], key=lambda x: abs(x - price))
+
+    near_leg = near[near["strike"] == atm].iloc[0]
+    far_leg = far[far["strike"] == atm].iloc[0]
+
+    return {
+        "Strike": atm,
+        "Sell Exp": near_leg["daysToExpiration"],
+        "Buy Exp": far_leg["daysToExpiration"]
+    }
 
 # =========================
 # MAIN ENGINE
 # =========================
-def run_engine(ticker, expiry):
-    df = load_data(ticker)
-    tk, expirations = load_options(ticker)
+def run_engine(ticker):
+    df_price = get_price_data(ticker)
+    chain = get_option_chain(ticker)
 
-    price = df['Close'].iloc[-1]
-    trend = get_trend(df)
-    regime = get_regime(df)
+    if chain is None or chain.empty:
+        return None
 
-    calls, puts = get_option_chain(tk, expiry)
+    chain = liquidity_filter(chain)
 
-    if regime == "LOW_VOL":
-        trade = build_credit_spread(price, calls, puts, trend)
-        strategy = "Credit Spread"
+    trend = get_trend(df_price)
+    regime = get_regime(df_price)
+    strategy = choose_strategy(trend, regime, df_price)
+
+    if strategy == "CREDIT":
+        result = build_credit_spread(chain, 0.15, 5, "put" if trend=="bullish" else "call")
+
+    elif strategy == "DEBIT":
+        result = build_debit_spread(chain, 0.5, 5, "call" if trend=="bullish" else "put")
+
+    elif strategy == "LEAPS":
+        result = build_leaps(chain, trend)
+
+    elif strategy == "CALENDAR":
+        result = build_calendar(chain, df_price["Close"].iloc[-1])
+
     else:
-        trade = build_debit_spread(price, calls, puts, trend)
-        strategy = "Debit Spread"
+        result = None
 
-    leaps = build_leaps(price, calls, puts, trend)
-
-    return price, trend, regime, strategy, trade, leaps
+    return trend, regime, strategy, result
 
 # =========================
 # UI
 # =========================
-st.title("📊 Level 3 Options Engine (REAL CONTRACTS)")
+st.title("🚀 Options Strategy Engine (Level 4.5 PRO)")
 
 ticker = st.sidebar.text_input("Ticker", "SPY")
 
-tk = yf.Ticker(ticker)
-expirations = tk.options
+if st.sidebar.button("Run Strategy"):
+    result = run_engine(ticker)
 
-expiry = st.sidebar.selectbox("Expiration", expirations)
+    if result is None:
+        st.error("⚠️ API issue — try again in a few seconds")
+    else:
+        trend, regime, strategy, output = result
 
-run = st.sidebar.button("Run Engine")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Trend", trend)
+        col2.metric("Regime", regime)
+        col3.metric("Strategy", strategy)
 
-if run:
-    price, trend, regime, strategy, trade, leaps = run_engine(ticker, expiry)
+        st.divider()
 
-    col1, col2, col3 = st.columns(3)
+        st.subheader("Trade Setup")
 
-    col1.metric("Price", round(price, 2))
-    col2.metric("Trend", trend)
-    col3.metric("Regime", regime)
+        if isinstance(output, pd.DataFrame):
+            st.dataframe(output)
+        else:
+            st.write(output)
 
-    st.divider()
-
-    st.success(f"Primary Strategy: {strategy}")
-    st.write(trade)
-
-    st.divider()
-
-    st.subheader("Alternative (Long-Term)")
-    st.write(leaps)
-
-    if datetime.now().hour >= 15:
-        st.warning("⚠️ Avoid holding overnight in high volatility markets")
+        if datetime.now().hour >= 15:
+            st.warning("⚠️ Avoid holding overnight")
