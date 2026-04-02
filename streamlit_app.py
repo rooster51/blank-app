@@ -7,34 +7,61 @@ from datetime import datetime
 st.set_page_config(layout="wide")
 
 # =========================
-# LOAD API KEY SAFELY
+# API KEY
 # =========================
 try:
     API_KEY = st.secrets["MARKETDATA_API_KEY"]
 except:
-    st.error("❌ Missing MarketData API key in secrets.toml")
+    st.error("❌ Missing MarketData API key in Streamlit secrets")
     st.stop()
 
 # =========================
-# PRICE DATA (LIGHT)
+# PRICE DATA
 # =========================
 @st.cache_data(ttl=300)
 def get_price_data(ticker):
     return yf.download(ticker, period="3mo", interval="1d")
 
 # =========================
-# MARKETDATA (HEAVY)
+# MARKETDATA (SAFE)
 # =========================
 @st.cache_data(ttl=600)
 def get_option_chain(ticker):
     url = f"https://api.marketdata.app/v1/options/chain/{ticker}/?token={API_KEY}"
-    res = requests.get(url)
 
-    if res.status_code != 200:
-        return None
+    try:
+        res = requests.get(url)
 
-    df = pd.DataFrame(res.json())
-    return df
+        if res.status_code != 200:
+            return {
+                "error": f"HTTP {res.status_code}",
+                "message": res.text[:300]
+            }
+
+        data = res.json()
+
+        if isinstance(data, dict) and "error" in data:
+            return {
+                "error": "API Error",
+                "message": str(data)
+            }
+
+        df = pd.DataFrame(data)
+
+        required = ["strike", "optionType", "delta", "bid", "ask"]
+        if not all(col in df.columns for col in required):
+            return {
+                "error": "Bad Data Format",
+                "message": f"Columns received: {list(df.columns)}"
+            }
+
+        return df
+
+    except Exception as e:
+        return {
+            "error": "Exception",
+            "message": str(e)
+        }
 
 # =========================
 # TREND + REGIME
@@ -48,10 +75,6 @@ def get_regime(df):
     move = abs(df["Close"].pct_change().iloc[-1]) * 100
     return "HIGH_VOL" if move > 1.2 else "LOW_VOL"
 
-def is_range_bound(df):
-    recent = df.tail(10)
-    return (recent["High"].max() - recent["Low"].min()) < (df["High"].rolling(10).mean().iloc[-1] * 1.2)
-
 # =========================
 # FILTERS
 # =========================
@@ -64,9 +87,6 @@ def delta_filter(df, target=0.15, option_type="put"):
     df["delta_diff"] = abs(abs(df["delta"]) - target)
     return df.sort_values("delta_diff").head(10)
 
-# =========================
-# POP
-# =========================
 def estimate_pop(delta):
     return round((1 - abs(delta)) * 100, 1)
 
@@ -151,12 +171,9 @@ def build_leaps(df, trend):
     long_dated = df[df["daysToExpiration"] > 120]
 
     if trend == "bullish":
-        calls = long_dated[long_dated["optionType"] == "call"]
-        return calls.sort_values("delta", ascending=False).head(5)[["strike","delta","ask"]]
-
+        return long_dated[long_dated["optionType"] == "call"].sort_values("delta", ascending=False).head(5)[["strike","delta","ask"]]
     else:
-        puts = long_dated[long_dated["optionType"] == "put"]
-        return puts.sort_values("delta").head(5)[["strike","delta","ask"]]
+        return long_dated[long_dated["optionType"] == "put"].sort_values("delta").head(5)[["strike","delta","ask"]]
 
 # =========================
 # CALENDAR
@@ -165,15 +182,21 @@ def build_calendar(df, price):
     near = df[df["daysToExpiration"] < 30]
     far = df[df["daysToExpiration"] > 60]
 
+    if near.empty or far.empty:
+        return {"error": "Not enough expirations for calendar"}
+
     atm = min(df["strike"], key=lambda x: abs(x - price))
 
-    near_leg = near[near["strike"] == atm].iloc[0]
-    far_leg = far[far["strike"] == atm].iloc[0]
+    near_leg = near[near["strike"] == atm]
+    far_leg = far[far["strike"] == atm]
+
+    if near_leg.empty or far_leg.empty:
+        return {"error": "No matching strikes for calendar"}
 
     return {
         "Strike": atm,
-        "Sell Exp (days)": near_leg["daysToExpiration"],
-        "Buy Exp (days)": far_leg["daysToExpiration"]
+        "Sell Exp (days)": int(near_leg.iloc[0]["daysToExpiration"]),
+        "Buy Exp (days)": int(far_leg.iloc[0]["daysToExpiration"])
     }
 
 # =========================
@@ -183,8 +206,12 @@ def run_engine(ticker):
     df_price = get_price_data(ticker)
     chain = get_option_chain(ticker)
 
+    # 🔴 ERROR HANDLING
+    if isinstance(chain, dict) and "error" in chain:
+        return chain
+
     if chain is None or chain.empty:
-        return None
+        return {"error": "No Data", "message": "Empty option chain"}
 
     chain = liquidity_filter(chain)
 
@@ -210,16 +237,15 @@ def run_engine(ticker):
     return trend, regime, strategy, result
 
 # =========================
-# UI (NO SIDEBAR)
+# UI
 # =========================
 st.title("🚀 Options Strategy Engine")
 
 ticker = st.text_input("Enter Ticker", "SPY")
 
-col_run, col_refresh = st.columns(2)
-
-run = col_run.button("Run Strategy")
-refresh = col_refresh.button("🔄 Refresh Cache")
+col1, col2 = st.columns(2)
+run = col1.button("Run Strategy")
+refresh = col2.button("🔄 Refresh Cache")
 
 if refresh:
     st.cache_data.clear()
@@ -228,15 +254,17 @@ if refresh:
 if run:
     result = run_engine(ticker)
 
-    if result is None:
-        st.error("⚠️ API issue — try again shortly")
+    # 🔴 SHOW REAL ERRORS
+    if isinstance(result, dict) and "error" in result:
+        st.error(f"⚠️ {result['error']}")
+        st.code(result["message"])
     else:
         trend, regime, strategy, output = result
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Trend", trend)
-        col2.metric("Regime", regime)
-        col3.metric("Strategy", strategy)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Trend", trend)
+        c2.metric("Regime", regime)
+        c3.metric("Strategy", strategy)
 
         st.divider()
         st.subheader("Trade Setup")
