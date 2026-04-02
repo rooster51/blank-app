@@ -6,7 +6,14 @@ from datetime import datetime
 
 st.set_page_config(layout="wide")
 
-API_KEY = st.secrets["MARKETDATA_API_KEY"]
+# =========================
+# LOAD API KEY SAFELY
+# =========================
+try:
+    API_KEY = st.secrets["MARKETDATA_API_KEY"]
+except:
+    st.error("❌ Missing MarketData API key in secrets.toml")
+    st.stop()
 
 # =========================
 # PRICE DATA (LIGHT)
@@ -165,12 +172,12 @@ def build_calendar(df, price):
 
     return {
         "Strike": atm,
-        "Sell Exp": near_leg["daysToExpiration"],
-        "Buy Exp": far_leg["daysToExpiration"]
+        "Sell Exp (days)": near_leg["daysToExpiration"],
+        "Buy Exp (days)": far_leg["daysToExpiration"]
     }
 
 # =========================
-# MAIN ENGINE
+# ENGINE
 # =========================
 def run_engine(ticker):
     df_price = get_price_data(ticker)
@@ -203,17 +210,26 @@ def run_engine(ticker):
     return trend, regime, strategy, result
 
 # =========================
-# UI
+# UI (NO SIDEBAR)
 # =========================
-st.title("🚀 Options Strategy Engine (Level 4.5 PRO)")
+st.title("🚀 Options Strategy Engine")
 
-ticker = st.sidebar.text_input("Ticker", "SPY")
+ticker = st.text_input("Enter Ticker", "SPY")
 
-if st.sidebar.button("Run Strategy"):
+col_run, col_refresh = st.columns(2)
+
+run = col_run.button("Run Strategy")
+refresh = col_refresh.button("🔄 Refresh Cache")
+
+if refresh:
+    st.cache_data.clear()
+    st.success("Cache cleared")
+
+if run:
     result = run_engine(ticker)
 
     if result is None:
-        st.error("⚠️ API issue — try again in a few seconds")
+        st.error("⚠️ API issue — try again shortly")
     else:
         trend, regime, strategy, output = result
 
@@ -223,11 +239,10 @@ if st.sidebar.button("Run Strategy"):
         col3.metric("Strategy", strategy)
 
         st.divider()
-
         st.subheader("Trade Setup")
 
         if isinstance(output, pd.DataFrame):
-            st.dataframe(output)
+            st.dataframe(output, use_container_width=True)
         else:
             st.write(output)
 
