@@ -3,14 +3,20 @@ import yfinance as yf
 import pandas as pd
 from datetime import datetime
 
-st.set_page_config(page_title="Options Strategy Engine", layout="wide")
+st.set_page_config(page_title="Premium Selling Engine", layout="wide")
 
 # =========================
 # DATA
 # =========================
 @st.cache_data(ttl=300)
 def get_data(ticker: str) -> pd.DataFrame:
-    df = yf.download(ticker, period="3mo", interval="1d", auto_adjust=False, progress=False)
+    df = yf.download(
+        ticker,
+        period="6mo",
+        interval="1d",
+        auto_adjust=False,
+        progress=False
+    )
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
@@ -23,18 +29,38 @@ def get_data(ticker: str) -> pd.DataFrame:
 # MARKET LOGIC
 # =========================
 def get_trend(df: pd.DataFrame) -> str:
-    df = df.copy()
-    df["ema9"] = df["Close"].ewm(span=9).mean()
-    df["ema21"] = df["Close"].ewm(span=21).mean()
+    work = df.copy()
+    work["ema9"] = work["Close"].ewm(span=9).mean()
+    work["ema21"] = work["Close"].ewm(span=21).mean()
+    work["ema50"] = work["Close"].ewm(span=50).mean()
 
-    if float(df["ema9"].iloc[-1]) > float(df["ema21"].iloc[-1]):
+    ema9 = float(work["ema9"].iloc[-1])
+    ema21 = float(work["ema21"].iloc[-1])
+    ema50 = float(work["ema50"].iloc[-1])
+    price = float(work["Close"].iloc[-1])
+
+    if ema9 > ema21 > ema50 and price > ema21:
         return "bullish"
-    return "bearish"
+    if ema9 < ema21 < ema50 and price < ema21:
+        return "bearish"
+    return "neutral"
 
 
 def get_regime(df: pd.DataFrame) -> str:
-    move = abs(float(df["Close"].pct_change().iloc[-1])) * 100
-    return "HIGH_VOL" if move > 1.2 else "LOW_VOL"
+    work = df.copy()
+    work["range"] = work["High"] - work["Low"]
+    work["atr10"] = work["range"].rolling(10).mean()
+
+    if work["atr10"].isna().iloc[-1]:
+        return "NORMAL_VOL"
+
+    atr_pct = float(work["atr10"].iloc[-1] / work["Close"].iloc[-1]) * 100
+
+    if atr_pct >= 2.2:
+        return "HIGH_VOL"
+    if atr_pct <= 1.0:
+        return "LOW_VOL"
+    return "NORMAL_VOL"
 
 
 def get_levels(df: pd.DataFrame) -> tuple[float, float]:
@@ -44,33 +70,76 @@ def get_levels(df: pd.DataFrame) -> tuple[float, float]:
     return support, resistance
 
 
-def is_range(df: pd.DataFrame) -> bool:
-    recent = df.tail(10)
-    recent_range = float(recent["High"].max() - recent["Low"].min())
-    avg_high = float(df["High"].rolling(10).mean().iloc[-1])
-    return recent_range < avg_high * 1.2
+def get_supply_demand_zones(df: pd.DataFrame) -> dict:
+    recent = df.tail(20)
+
+    support = float(recent["Low"].min())
+    resistance = float(recent["High"].max())
+
+    zone_width = max((resistance - support) * 0.08, float(df["Close"].iloc[-1]) * 0.003)
+
+    demand_low = support
+    demand_high = support + zone_width
+
+    supply_low = resistance - zone_width
+    supply_high = resistance
+
+    return {
+        "demand_low": round(demand_low, 2),
+        "demand_high": round(demand_high, 2),
+        "supply_low": round(supply_low, 2),
+        "supply_high": round(supply_high, 2),
+    }
 
 
-def choose_strategy(trend: str, regime: str, range_bound: bool) -> str:
-    if range_bound and regime == "LOW_VOL":
-        return "IRON_CONDOR"
+def is_range_bound(df: pd.DataFrame) -> bool:
+    work = df.tail(20).copy()
+    total_range = float(work["High"].max() - work["Low"].min())
+    avg_close = float(work["Close"].mean())
 
-    if range_bound and regime == "HIGH_VOL":
-        return "CALENDAR"
+    if avg_close == 0:
+        return False
 
-    if regime == "HIGH_VOL":
-        return "DEBIT"
+    range_pct = (total_range / avg_close) * 100
 
-    if regime == "LOW_VOL":
-        return "CREDIT"
+    work["ema9"] = work["Close"].ewm(span=9).mean()
+    work["ema21"] = work["Close"].ewm(span=21).mean()
 
-    return "LEAPS"
+    ema_spread_pct = abs(float(work["ema9"].iloc[-1] - work["ema21"].iloc[-1])) / avg_close * 100
+
+    return range_pct < 6.0 and ema_spread_pct < 0.8
+
+
+def get_price_location(price: float, support: float, resistance: float, zones: dict) -> str:
+    if resistance <= support:
+        return "unknown"
+
+    range_width = resistance - support
+    middle_low = support + (range_width * 0.4)
+    middle_high = support + (range_width * 0.6)
+
+    if zones["demand_low"] <= price <= zones["demand_high"]:
+        return "near_support"
+
+    if zones["supply_low"] <= price <= zones["supply_high"]:
+        return "near_resistance"
+
+    if middle_low <= price <= middle_high:
+        return "middle"
+
+    if price < zones["demand_low"]:
+        return "below_support"
+
+    if price > zones["supply_high"]:
+        return "above_resistance"
+
+    return "in_between"
 
 
 # =========================
 # TRADE RULES
 # =========================
-def get_trade_rules(df: pd.DataFrame, trend: str, regime: str) -> dict:
+def get_trade_rules(df: pd.DataFrame, trend: str, regime: str, price_location: str) -> dict:
     rules = {
         "allow_trade": True,
         "reasons": [],
@@ -82,11 +151,12 @@ def get_trade_rules(df: pd.DataFrame, trend: str, regime: str) -> dict:
         rules["reasons"].append("Not enough price data")
         return rules
 
-    last_close = float(df["Close"].iloc[-1])
-    prev_close = float(df["Close"].iloc[-2])
+    work = df.copy()
+
+    last_close = float(work["Close"].iloc[-1])
+    prev_close = float(work["Close"].iloc[-2])
     day_move_pct = abs((last_close - prev_close) / prev_close) * 100
 
-    work = df.copy()
     work["range"] = work["High"] - work["Low"]
     atr10 = float(work["range"].rolling(10).mean().iloc[-1])
     today_range = float(work["range"].iloc[-1])
@@ -99,70 +169,171 @@ def get_trade_rules(df: pd.DataFrame, trend: str, regime: str) -> dict:
     up_days = int((last5["Close"] > last5["Open"]).sum())
     down_days = int((last5["Close"] < last5["Open"]).sum())
 
-    if day_move_pct > 1.8:
+    if day_move_pct > 2.0:
         rules["allow_trade"] = False
         rules["reasons"].append(f"Daily move too large ({day_move_pct:.2f}%)")
 
-    if today_range > atr10 * 1.6:
+    if today_range > atr10 * 1.75:
         rules["allow_trade"] = False
-        rules["reasons"].append("Today’s range is too large versus recent average")
-
-    if ema_spread_pct < 0.15 and regime == "LOW_VOL":
-        rules["warnings"].append("Trend strength is weak")
+        rules["reasons"].append("Today's range is too large versus recent average")
 
     if up_days >= 2 and down_days >= 2 and regime == "HIGH_VOL":
         rules["allow_trade"] = False
-        rules["reasons"].append("Recent price action is too choppy")
+        rules["reasons"].append("Recent price action is too choppy for premium selling")
+
+    if trend == "neutral" and price_location != "middle":
+        rules["warnings"].append("Trend is neutral")
+
+    if ema_spread_pct < 0.15:
+        rules["warnings"].append("Trend strength is weak")
 
     current_hour = datetime.now().hour
     if current_hour >= 15:
         rules["allow_trade"] = False
-        rules["reasons"].append("Do not open new trades late in the day")
+        rules["reasons"].append("Do not open new premium trades late in the day")
 
     if regime == "HIGH_VOL":
-        rules["warnings"].append("Avoid holding overnight in high volatility")
+        rules["warnings"].append("High volatility can create overnight gap risk")
+
+    if price_location == "middle":
+        rules["warnings"].append("Middle of the range is better for condors than one-sided spreads")
 
     return rules
 
 
 # =========================
-# STRATEGY BUILDERS
+# STRATEGY LOGIC
 # =========================
-def credit_spread(price: float, support: float, resistance: float, trend: str) -> str:
-    if trend == "bullish":
-        short_strike = round(support * 0.98, 2)
-        long_strike = round(support * 0.95, 2)
-        return f"Put Credit → Sell {short_strike} / Buy {long_strike}"
-    short_strike = round(resistance * 1.02, 2)
-    long_strike = round(resistance * 1.05, 2)
-    return f"Call Credit → Sell {short_strike} / Buy {long_strike}"
+def choose_premium_strategy(trend: str, regime: str, range_bound: bool, price_location: str) -> str:
+    if range_bound and price_location == "middle":
+        return "IRON_CONDOR"
+
+    if trend == "bullish" and price_location == "near_support":
+        return "PUT_CREDIT"
+
+    if trend == "bearish" and price_location == "near_resistance":
+        return "CALL_CREDIT"
+
+    if trend == "neutral" and range_bound and price_location in ["near_support", "near_resistance", "middle"]:
+        return "IRON_CONDOR"
+
+    return "NO_TRADE"
 
 
-def debit_spread(price: float, trend: str) -> str:
-    if trend == "bullish":
-        buy_strike = round(price * 0.99, 2)
-        sell_strike = round(price * 1.03, 2)
-        return f"Call Debit → Buy {buy_strike} / Sell {sell_strike}"
-    buy_strike = round(price * 1.01, 2)
-    sell_strike = round(price * 0.97, 2)
-    return f"Put Debit → Buy {buy_strike} / Sell {sell_strike}"
+def round_to_strike(value: float, increment: float = 1.0) -> float:
+    return round(round(value / increment) * increment, 2)
 
 
-def leaps(price: float, trend: str) -> str:
-    if trend == "bullish":
-        strike = round(price * 0.90, 2)
-        return f"LEAPS Call → Buy ITM around {strike} (6–12 months)"
-    strike = round(price * 1.10, 2)
-    return f"LEAPS Put → Buy ITM around {strike} (6–12 months)"
+def choose_strike_increment(price: float) -> float:
+    if price < 25:
+        return 0.5
+    if price < 200:
+        return 1.0
+    return 5.0
 
 
-def calendar(price: float) -> str:
-    strike = round(price, 2)
-    return f"Calendar → Sell near-term {strike}, Buy longer-term same strike"
+def build_put_credit_spread(price: float, zones: dict, support: float, atr: float) -> dict:
+    increment = choose_strike_increment(price)
+
+    buffer = max(atr * 0.35, price * 0.005)
+    short_target = min(zones["demand_low"] - buffer, support - (atr * 0.20))
+    long_target = short_target - max(atr * 0.50, price * 0.01)
+
+    short_strike = round_to_strike(short_target, increment)
+    long_strike = round_to_strike(long_target, increment)
+
+    if long_strike >= short_strike:
+        long_strike = round_to_strike(short_strike - increment, increment)
+
+    return {
+        "label": f"Put Credit Spread → Sell {short_strike} / Buy {long_strike}",
+        "short_strike": short_strike,
+        "long_strike": long_strike,
+        "zone_used": f"Demand {zones['demand_low']} - {zones['demand_high']}",
+        "bias": "bullish"
+    }
 
 
-def iron_condor(support: float, resistance: float) -> str:
-    return f"Iron Condor → Expected range {round(support, 2)} to {round(resistance, 2)}"
+def build_call_credit_spread(price: float, zones: dict, resistance: float, atr: float) -> dict:
+    increment = choose_strike_increment(price)
+
+    buffer = max(atr * 0.35, price * 0.005)
+    short_target = max(zones["supply_high"] + buffer, resistance + (atr * 0.20))
+    long_target = short_target + max(atr * 0.50, price * 0.01)
+
+    short_strike = round_to_strike(short_target, increment)
+    long_strike = round_to_strike(long_target, increment)
+
+    if long_strike <= short_strike:
+        long_strike = round_to_strike(short_strike + increment, increment)
+
+    return {
+        "label": f"Call Credit Spread → Sell {short_strike} / Buy {long_strike}",
+        "short_strike": short_strike,
+        "long_strike": long_strike,
+        "zone_used": f"Supply {zones['supply_low']} - {zones['supply_high']}",
+        "bias": "bearish"
+    }
+
+
+def build_iron_condor(price: float, zones: dict, support: float, resistance: float, atr: float) -> dict:
+    increment = choose_strike_increment(price)
+
+    put_short_target = support - max(atr * 0.30, price * 0.005)
+    put_long_target = put_short_target - max(atr * 0.50, price * 0.01)
+
+    call_short_target = resistance + max(atr * 0.30, price * 0.005)
+    call_long_target = call_short_target + max(atr * 0.50, price * 0.01)
+
+    put_short = round_to_strike(put_short_target, increment)
+    put_long = round_to_strike(put_long_target, increment)
+    call_short = round_to_strike(call_short_target, increment)
+    call_long = round_to_strike(call_long_target, increment)
+
+    if put_long >= put_short:
+        put_long = round_to_strike(put_short - increment, increment)
+
+    if call_long <= call_short:
+        call_long = round_to_strike(call_short + increment, increment)
+
+    return {
+        "label": f"Iron Condor → Buy {put_long} / Sell {put_short} | Sell {call_short} / Buy {call_long}",
+        "put_short": put_short,
+        "put_long": put_long,
+        "call_short": call_short,
+        "call_long": call_long,
+        "zone_used": f"Demand {zones['demand_low']} - {zones['demand_high']} / Supply {zones['supply_low']} - {zones['supply_high']}",
+        "bias": "neutral"
+    }
+
+
+def score_trade_quality(trend: str, regime: str, range_bound: bool, price_location: str, strategy: str, rules: dict) -> int:
+    score = 50
+
+    if strategy in ["PUT_CREDIT", "CALL_CREDIT", "IRON_CONDOR"]:
+        score += 10
+
+    if trend in ["bullish", "bearish"]:
+        score += 10
+
+    if regime == "NORMAL_VOL":
+        score += 10
+    elif regime == "LOW_VOL":
+        score += 5
+    elif regime == "HIGH_VOL":
+        score -= 5
+
+    if price_location in ["near_support", "near_resistance"]:
+        score += 15
+
+    if range_bound and strategy == "IRON_CONDOR":
+        score += 10
+
+    if not rules["allow_trade"]:
+        score = 0
+
+    score -= len(rules["warnings"]) * 3
+    return max(0, min(score, 100))
 
 
 # =========================
@@ -170,35 +341,23 @@ def iron_condor(support: float, resistance: float) -> str:
 # =========================
 def get_execution_plan(strategy: str) -> dict:
     plans = {
-        "CREDIT": {
-            "entry": "Only enter near support or resistance, not in the middle of the range.",
-            "profit_target": "Take profits at 40% to 50% of max profit.",
-            "stop_rule": "Exit if spread value reaches 2x entry credit.",
-            "holding_rule": "Do not hold overnight in unstable conditions."
+        "PUT_CREDIT": {
+            "entry": "Enter only when price is at or near demand/support, not after a large bullish extension.",
+            "profit_target": "Take profits at 40% to 60% of max profit.",
+            "stop_rule": "Exit if spread value reaches 1.5x to 2x entry credit or support fails hard.",
+            "holding_rule": "Avoid holding through major news or unstable overnight conditions."
         },
-        "DEBIT": {
-            "entry": "Enter only with confirmed momentum, not after a huge extension bar.",
-            "profit_target": "Take profits at 25% to 40% of max profit on a quick move.",
-            "stop_rule": "Cut the trade if premium loses 35% to 40%.",
-            "holding_rule": "Only hold overnight if the trend is strong and volatility is not expanding."
-        },
-        "LEAPS": {
-            "entry": "Use only with strong higher-timeframe trend alignment.",
-            "profit_target": "Scale out into strength instead of exiting all at once.",
-            "stop_rule": "Exit on a clear trend break, not on normal short-term noise.",
-            "holding_rule": "Designed for longer holding periods."
-        },
-        "CALENDAR": {
-            "entry": "Use when price is near the expected pin area or center of the range.",
-            "profit_target": "Take profits before front expiration behavior becomes erratic.",
-            "stop_rule": "Exit if price moves too far away from the strike.",
-            "holding_rule": "Monitor closely as the short leg nears expiration."
+        "CALL_CREDIT": {
+            "entry": "Enter only when price is at or near supply/resistance, not after a large bearish extension.",
+            "profit_target": "Take profits at 40% to 60% of max profit.",
+            "stop_rule": "Exit if spread value reaches 1.5x to 2x entry credit or resistance breaks cleanly.",
+            "holding_rule": "Avoid holding through major news or unstable overnight conditions."
         },
         "IRON_CONDOR": {
-            "entry": "Use only in stable, range-bound markets.",
+            "entry": "Use only when price is range-bound and positioned away from both short strikes.",
             "profit_target": "Take profits at 35% to 50% of max profit.",
-            "stop_rule": "Exit the threatened side early. Do not wait for max loss.",
-            "holding_rule": "Avoid overnight exposure if the range starts breaking."
+            "stop_rule": "Exit or reduce the threatened side early. Do not wait for max loss.",
+            "holding_rule": "Avoid holding if price starts trending strongly out of range."
         }
     }
     return plans.get(strategy, {})
@@ -227,35 +386,48 @@ def run_engine(ticker: str) -> dict:
     trend = get_trend(df)
     regime = get_regime(df)
     support, resistance = get_levels(df)
-    range_bound = is_range(df)
+    zones = get_supply_demand_zones(df)
+    range_bound = is_range_bound(df)
+    price_location = get_price_location(price, support, resistance, zones)
 
-    strategy = choose_strategy(trend, regime, range_bound)
-    rules = get_trade_rules(df, trend, regime)
+    work = df.copy()
+    work["range"] = work["High"] - work["Low"]
+    atr10 = float(work["range"].rolling(10).mean().iloc[-1])
+
+    rules = get_trade_rules(df, trend, regime, price_location)
+    strategy = choose_premium_strategy(trend, regime, range_bound, price_location)
+
+    if strategy == "NO_TRADE":
+        rules["allow_trade"] = False
+        rules["reasons"].append("Price is not in a premium-selling location")
 
     if not rules["allow_trade"]:
+        score = score_trade_quality(trend, regime, range_bound, price_location, strategy, rules)
         return {
             "blocked": True,
             "price": price,
             "trend": trend,
             "regime": regime,
             "strategy": strategy,
-            "rules": rules
+            "rules": rules,
+            "support": round(support, 2),
+            "resistance": round(resistance, 2),
+            "zones": zones,
+            "price_location": price_location,
+            "score": score
         }
 
-    if strategy == "CREDIT":
-        trade = credit_spread(price, support, resistance, trend)
-    elif strategy == "DEBIT":
-        trade = debit_spread(price, trend)
-    elif strategy == "LEAPS":
-        trade = leaps(price, trend)
-    elif strategy == "CALENDAR":
-        trade = calendar(price)
+    if strategy == "PUT_CREDIT":
+        trade = build_put_credit_spread(price, zones, support, atr10)
+    elif strategy == "CALL_CREDIT":
+        trade = build_call_credit_spread(price, zones, resistance, atr10)
     elif strategy == "IRON_CONDOR":
-        trade = iron_condor(support, resistance)
+        trade = build_iron_condor(price, zones, support, resistance, atr10)
     else:
-        return {"error": "No valid strategy found"}
+        return {"error": "No valid premium strategy found"}
 
     plan = get_execution_plan(strategy)
+    score = score_trade_quality(trend, regime, range_bound, price_location, strategy, rules)
 
     return {
         "blocked": False,
@@ -267,15 +439,19 @@ def run_engine(ticker: str) -> dict:
         "rules": rules,
         "plan": plan,
         "support": round(support, 2),
-        "resistance": round(resistance, 2)
+        "resistance": round(resistance, 2),
+        "zones": zones,
+        "price_location": price_location,
+        "range_bound": range_bound,
+        "score": score
     }
 
 
 # =========================
 # UI
 # =========================
-st.title("🚀 Options Strategy Engine")
-st.caption("This engine blocks trades in unstable conditions and adds execution rules to reduce bad entries.")
+st.title("💰 Premium Selling Engine")
+st.caption("Premium-first logic: put credit spreads, call credit spreads, and iron condors based on location, trend, and regime.")
 
 ticker = st.text_input("Enter Ticker", "SPY").strip().upper()
 
@@ -298,19 +474,30 @@ if run:
         st.error(f"⚠️ {result['error']}")
         st.stop()
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Price", f"{result['price']:.2f}")
     c2.metric("Trend", result["trend"])
     c3.metric("Regime", result["regime"])
+    c4.metric("Score", f"{result['score']}/100")
 
     st.divider()
+
+    z1, z2, z3 = st.columns(3)
+    z1.metric("Support", f"{result['support']:.2f}")
+    z2.metric("Resistance", f"{result['resistance']:.2f}")
+    z3.metric("Location", result["price_location"])
+
+    st.write(
+        f"**Demand Zone:** {result['zones']['demand_low']} - {result['zones']['demand_high']}  \n"
+        f"**Supply Zone:** {result['zones']['supply_low']} - {result['zones']['supply_high']}"
+    )
 
     if result["blocked"]:
         st.error("🚫 NO TRADE")
 
-        c4, c5 = st.columns(2)
-        c4.metric("Suggested Strategy", result["strategy"])
-        c5.metric("Status", "Blocked")
+        c5, c6 = st.columns(2)
+        c5.metric("Suggested Strategy", result["strategy"])
+        c6.metric("Status", "Blocked")
 
         st.subheader("Why")
         for reason in result["rules"]["reasons"]:
@@ -322,13 +509,14 @@ if run:
                 st.write(f"- {warning}")
 
     else:
-        c4, c5, c6 = st.columns(3)
-        c4.metric("Strategy", result["strategy"])
-        c5.metric("Support", f"{result['support']:.2f}")
-        c6.metric("Resistance", f"{result['resistance']:.2f}")
+        c5, c6 = st.columns(2)
+        c5.metric("Strategy", result["strategy"])
+        c6.metric("Range Bound", "Yes" if result["range_bound"] else "No")
 
         st.success(f"✅ Trade Idea: {result['strategy']}")
-        st.write(result["trade"])
+        st.write(result["trade"]["label"])
+        st.write(f"**Zone Used:** {result['trade']['zone_used']}")
+        st.write(f"**Bias:** {result['trade']['bias']}")
 
         if result["rules"]["warnings"]:
             st.subheader("Warnings")
